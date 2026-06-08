@@ -1,0 +1,7 @@
+.env
+node_modules/
+dist/
+references/
+test-artifacts/
+.mcp/
+pr-renderer.ts

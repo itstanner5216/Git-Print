@@ -3,10 +3,20 @@
  *
  * Fixture test for renderPR(). Builds a PRData object mirroring the canonical
  * example (PR #20 — the tree-sitter DEF_TYPES PR), renders it, and asserts the
- * output matches the example's structure: flat "Comment N" cards, line-numbered
- * code context, and CLEAN unified-diff suggestion blocks (the bug this fixes).
+ * output matches the PR-page-as-markdown contract:
  *
- * Run:  node test-render-fixture.mjs   (after `npm run build`)
+ *   - One flat "Comment N" flow in scroll order — no backend buckets
+ *     (Goals §4, Constraints §2/§3/§4).
+ *   - Markdown, not UI furniture: no action buttons, no tab bars, no reply
+ *     boxes (Constraints §9).
+ *   - Inline threads keep the GitHub UI stack: reviewer + timestamp +
+ *     severity, file path + line anchor, line-numbered code context,
+ *     comment prose, numbered suggested changesets with @@ headers.
+ *   - Comment prose is byte-faithful — never escaped or reflowed.
+ *   - Bot promo/footer lines are dropped; whole comments that are nothing
+ *     but promotion are skipped without consuming a Comment number.
+ *
+ * Run:  node test-render-fixture.mjs   (after `pnpm build`)
  */
 
 import { renderPR } from "./dist/pr-renderer.js";
@@ -44,6 +54,8 @@ const thread1Body = [
   "}",
   "// include trailing quantifier + capture in the pattern text we",
   "```",
+  "",
+  "Copilot uses AI. Check for mistakes.",
 ].join("\n");
 
 const thread2Hunk = [
@@ -63,6 +75,28 @@ const thread2Body = [
   "```suggestion",
   "  // XML/HTML element-shape patterns (PascalCase upstream node names)",
   "```",
+  "",
+  "Copilot uses AI. Check for mistakes.",
+].join("\n");
+
+// An issue comment thick with web→markdown debris — exercises the cleaning
+// policy inside the real render path.
+const noisyIssueCommentBody = [
+  "<!-- coderabbit metadata -->",
+  "Check [the migration guide](https://docs.example.com/guide) before merging — also see <https://auto.generated.link/from/translation>.",
+  "",
+  "![badge](https://img.shields.io/badge/coverage-98%25-green.svg)",
+  "",
+  "The `config_loader.ts` parser uses snake_case_keys and array[0] access.",
+  "",
+  "[Share on Twitter](https://twitter.com/intent/tweet?text=hi)",
+  "Thanks for using CodeRabbit! It's free for OSS.",
+].join("\n");
+
+// A comment that is NOTHING but promotion — must be skipped entirely.
+const promoOnlyCommentBody = [
+  "Thanks for using CodeRabbit! It's free for OSS.",
+  "[Share on Twitter](https://twitter.com/intent/tweet?text=love)",
 ].join("\n");
 
 const data = {
@@ -141,7 +175,22 @@ const data = {
       author_association: "NONE",
     },
   ],
-  issueComments: [],
+  issueComments: [
+    {
+      id: 201,
+      body: noisyIssueCommentBody,
+      user: { login: "coderabbitai", type: "Bot" },
+      created_at: "2026-06-07T10:01:00Z",
+      author_association: "NONE",
+    },
+    {
+      id: 202,
+      body: promoOnlyCommentBody,
+      user: { login: "coderabbitai", type: "Bot" },
+      created_at: "2026-06-07T10:02:00Z",
+      author_association: "NONE",
+    },
+  ],
   resolvedThreadMap: null,
   unifiedChecks: [
     { name: "CodeQL Advanced / Analyze (javascript-typescript) (pull_request)", status: "in_progress", conclusion: null, startedAt: "2026-06-07T10:00:00Z", completedAt: null, detailsUrl: null, description: "Code scanning is waiting for results on commits e3e6e22 or 6ed1f2b.", checkRunId: 1, source: "check_run" },
@@ -157,7 +206,7 @@ const data = {
 
 // ─── Run renderer ─────────────────────────────────────────────────────────────
 
-const outPath = join(tmpdir(), `pr20-fixture-${Date.now()}.txt`);
+const outPath = join(tmpdir(), `pr20-fixture-${Date.now()}.md`);
 await renderPR(data, {
   owner: "itstanner5216",
   repo: "zenith",
@@ -175,110 +224,105 @@ const check = (name, cond) => { if (!cond) failures.push(name); };
 const idx = (s) => out.indexOf(s);
 const has = (s) => out.includes(s);
 
-// Header
-check("starts with double rule", out.startsWith("═"));
-check("title line", has("PR #20 — feat(tree-sitter): export DEF_TYPES + regression test for definition node coverage"));
-check("state line one-liner", has("[Open] itstanner5216 wants to merge 4 commits into main from feat/def-types-coverage"));
-check("tabs line", has("Tabs: Conversation 3 | Commits 4 | Checks 7 | Files changed 3"));
-check("branches line", has("Branches: feat/def-types-coverage → main"));
-check("commits line", has("e3e6e22, 6ed1f2b") && has("(4 total)"));
-check("stats line", has("Stats: +73 / -0"));
+// ── Header: title, status line, counters ──
+check("h1 title", has("# PR #20 — feat(tree-sitter): export DEF_TYPES + regression test for definition node coverage"));
+check("status line", has("**Open** · itstanner5216 wants to merge 4 commits into `main` from `feat/def-types-coverage`"));
+// Conversation count mirrors the GitHub page number — the promo-only comment
+// exists on the page (we just don't print it), so it counts: 2 issue comments
+// + 2 review comments + 1 review with body = 5.
+check("counters line", has("Conversation 5 · Commits 4 · Checks 7 · Files changed 3 · `+73` `−0`"));
 
-// PR information (inline Label: value)
-check("reviewers inline", has("Reviewers: Copilot, coderabbitai [Bot]"));
-check("assignees inline", has("Assignees: No one"));
-check("labels inline", has("Labels: None"));
-check("projects inline", has("Projects: None"));
-check("milestone inline", has("Milestone: None"));
+// ── PR description as post body (directly under title, unlabeled) ──
+check("description present", has("Exports the DEF_TYPES constant from the tree-sitter symbols module"));
+check("description before sidebar", idx("Exports the DEF_TYPES") < idx("**Reviewers:**"));
 
-// Flat Comment N numbering, no sub-headers
-check("comment 1", has("COMMENT 1"));
-check("comment 2", has("COMMENT 2"));
-check("comment 3", has("COMMENT 3"));
-check("comment 4", has("COMMENT 4"));
-check("no 5th comment", !has("COMMENT 5"));
-check("no INLINE THREAD subheaders", !has("INLINE THREAD"));
-check("no markdown subheaders", !/^#{1,6}\s/m.test(out));
-const commentHeaders = (out.match(/^COMMENT \d+$/gm) || []).length;
-check("exactly 4 comment cards", commentHeaders === 4);
+// ── Sidebar metadata ──
+check("reviewers", has("- **Reviewers:** Copilot, coderabbitai [Bot]"));
+check("assignees", has("- **Assignees:** No one"));
+check("labels", has("- **Labels:** None"));
+check("milestone", has("- **Milestone:** None"));
 
-// Card ordering: description < review < thread1 < thread2
-check("order c1<c2", idx("COMMENT 1") < idx("COMMENT 2"));
-check("order c2<c3", idx("COMMENT 2") < idx("COMMENT 3"));
-check("order c3<c4", idx("COMMENT 3") < idx("COMMENT 4"));
-check("description is comment 1", idx("itstanner5216 commented — Owner") > idx("COMMENT 1") && idx("itstanner5216 commented — Owner") < idx("COMMENT 2"));
-check("review is comment 2", idx("coderabbitai [Bot] requested changes") > idx("COMMENT 2") && idx("coderabbitai [Bot] requested changes") < idx("COMMENT 3"));
-check("review verb 'requested changes' (not raw state)", has("requested changes") && !has("CHANGES_REQUESTED"));
-check("thread1 is comment 3", idx("File: packages/zenith-mcp/tests/def-types-coverage.test.js") > idx("COMMENT 3") && idx("File: packages/zenith-mcp/tests/def-types-coverage.test.js") < idx("COMMENT 4"));
-check("thread2 is comment 4", idx("File: packages/zenith-mcp/src/core/tree-sitter/symbols.ts") > idx("COMMENT 4"));
+// ── One flat Comments flow, numbered in scroll order ──
+check("comments heading", has("## Comments"));
+check("comment 1", has("### Comment #1"));
+check("comment 2", has("### Comment #2"));
+check("comment 3", has("### Comment #3"));
+check("comment 4", has("### Comment #4"));
+const commentHeaders = (out.match(/^### Comment #\d+$/gm) || []).length;
+check("exactly 4 numbered comments (promo-only comment skipped)", commentHeaders === 4);
+check("ordering c1<c2<c3<c4",
+  idx("### Comment #1") < idx("### Comment #2") &&
+  idx("### Comment #2") < idx("### Comment #3") &&
+  idx("### Comment #3") < idx("### Comment #4"));
 
-// Inline thread 1 — identity + line-numbered code context
-check("t1 anchor multi-line", has("Anchor: Comment on lines +155 to +158"));
-check("t1 thread status open", has("Thread status: Open"));
-check("t1 code context header", has("Code context:"));
-check("t1 numbered context 155", has("  155 + if (c !== '(' && c !== '[') { i++; continue; }"));
-check("t1 numbered context 158", has("  158 + // include trailing quantifier + capture in the pattern text we"));
-check("t1 reviewer line [AI] + severity", /Reviewer: Copilot \[AI\] \| .* \| Severity: Medium/.test(out));
+// ── No backend buckets, no UI furniture (Constraints §3, §9) ──
+check("no Reviews section", !/^#{1,6}\s+Reviews\b/m.test(out));
+check("no Inline Comments section", !/^#{1,6}\s+Inline\b/mi.test(out));
+check("no Suggestions section", !/^#{1,6}\s+Suggestions\b/m.test(out));
+check("no Timeline section", !/^#{1,6}\s+Timeline\b/mi.test(out));
+check("no Bot Findings section", !/^#{1,6}\s+Bot/mi.test(out));
+check("no action buttons", !has("[Commit suggestion]") && !has("[Resolve conversation]") && !has("[Reply]"));
+check("no tab bar", !has("Tabs:"));
+check("no raw verdict enum", !has("CHANGES_REQUESTED"));
 
-// Inline thread 1 — CLEAN suggestion diff (THE BUG FIX)
-check("t1 suggested changeset header", has("Suggested changeset 1:"));
-check("t1 recomputed @@ header", /  @@ -\d+,\d+ \+\d+,\d+ @@ function extractDefinitionNodeTypes/.test(out));
-check("t1 removed line is the break", has("  -if (end === -1) break;"));
-check("t1 added throw block", has("  +if (end === -1) {") && has("  +}"));
-// The unchanged lines must be CONTEXT, never marked as removed (the old bug
-// dumped every original line with a '-' prefix):
-check("t1 unchanged line not marked removed", !has("-if (c !== '(' && c !== '[')"));
-check("t1 unchanged line not marked removed (findMatchingClose)", !has("-const end = findMatchingClose(text, i);"));
+// ── Comment 1: review event with verdict verb ──
+check("review verdict verb", has("**coderabbitai [Bot]** requested changes · 2026-06-07 10:00:00 UTC"));
+check("review body kept", has("Actionable comments were posted on this review."));
+check("View reviewed changes dropped", !has("View reviewed changes"));
 
-// Inline thread 2 — single-line anchor + clean one-line swap
-check("t2 anchor single line", has("Anchor: Comment on line +68"));
-check("t2 numbered context 65", has("  65 + // ----------------------------------------------------------"));
-check("t2 numbered context 68 camelCase", has("  68 +   // XML/HTML element-shape patterns (camelCase upstream node names)"));
-check("t2 reviewer severity low", /Reviewer: Copilot \[AI\] \| .* \| Severity: Low/.test(out));
+// ── Comment 2 (thread 1): UI stack — header w/ severity, file+anchor, numbered context, prose, changeset ──
+check("t1 header has severity", has("**Copilot [AI]** reviewed · 2026-06-07 10:00:00 UTC · Severity: Medium"));
+check("t1 file+anchor", has("`packages/zenith-mcp/tests/def-types-coverage.test.js` — lines +155 to +158"));
+check("t1 numbered context 155", has("155 + if (c !== '(' && c !== '[') { i++; continue; }"));
+check("t1 numbered context 158", has("158 + // include trailing quantifier + capture in the pattern text we"));
+check("t1 prose byte-faithful", has("extractDefinitionNodeTypes() currently breaks on an unmatched delimiter because findMatchingClose() returns -1."));
+check("t1 severity line not duplicated in body", !/^Severity: Medium$/m.test(out));
+check("t1 changeset header with path", has("**Suggested changeset 1:** `packages/zenith-mcp/tests/def-types-coverage.test.js`"));
+check("t1 @@ header with heading", /@@ -\d+,\d+ \+\d+,\d+ @@ function extractDefinitionNodeTypes\(scmText\) \{/.test(out));
+check("t1 removed line", has("-if (end === -1) break;"));
+check("t1 added throw", has("+  throw new Error(`Malformed tree-sitter query: unmatched ${c} at offset ${i}`);"));
+check("t1 unchanged line is context not removal", !has("-if (c !== '(' && c !== '[')"));
+check("t1 Copilot footer dropped", !has("Copilot uses AI"));
+
+// ── Comment 3 (thread 2): single-line anchor + one-line swap ──
+check("t2 header has severity low", has("**Copilot [AI]** reviewed · 2026-06-07 10:00:01 UTC · Severity: Low"));
+check("t2 file+anchor", has("`packages/zenith-mcp/src/core/tree-sitter/symbols.ts` — line +68"));
+check("t2 numbered context 65", has("65 + // ----------------------------------------------------------"));
+check("t2 numbered context 68", has("68 +   // XML/HTML element-shape patterns (camelCase upstream node names)"));
 check("t2 removed camelCase", has("-  // XML/HTML element-shape patterns (camelCase upstream node names)"));
 check("t2 added PascalCase", has("+  // XML/HTML element-shape patterns (PascalCase upstream node names)"));
 
-// Anti raw-dump: only the 2 recomputed suggestion @@ headers should appear.
-const atCount = (out.match(/@@ -\d+/g) || []).length;
-check("exactly 2 @@ headers (no raw diff_hunk dump)", atCount === 2);
+// ── Comment 4 (noisy issue comment): debris policy in the render path ──
+check("c4 link text kept", has("Check the migration guide before merging"));
+check("c4 link target gone", !has("docs.example.com/guide"));
+check("c4 angle autolink gone", !has("auto.generated.link"));
+check("c4 image gone", !has("img.shields.io"));
+check("c4 prose identifiers byte-faithful", has("The `config_loader.ts` parser uses snake_case_keys and array[0] access."));
+check("c4 no escape mangling", !has("snake\\_case") && !has("array\\[0]"));
+check("c4 share line dropped", !has("Share on Twitter"));
+check("c4 thanks line dropped", !has("Thanks for using CodeRabbit"));
 
-// Actions line (single line, indented)
-check("t1 actions line", has("  [Commit suggestion] [Add suggestion to batch] [Reply] [Resolve conversation]"));
+// ── Resolved: section absent when no resolved threads exist (Goals §6) ──
+check("no Resolved section", !has("## Resolved"));
 
-// CHANGES REVIEWED (indented counts)
-check("changes reviewed header", has("CHANGES REVIEWED"));
-check("changes requested sentence", has("1 change requested by reviewers with write access."));
-check("changes requested indented mark", has("  ✕ 1 requested change"));
+// ── Checks + merge status ──
+check("checks heading", has("## Checks"));
+check("checks summary", has("4 successful · 3 in progress · 0 failed"));
+check("check in progress", has("- ◷ CodeQL Advanced / Analyze (javascript-typescript) (pull_request) — In progress"));
+check("check skipped", has("- ✓ CodeRabbit Review — Skipped"));
+check("check duration", has("- ✓ GitGuardian Security Checks — Successful in 1s"));
+check("merge blocked with reasons", has("**Merging is blocked** — 1 change requested, 3 checks in progress."));
 
-// CI / CHECKS (indented, inline None)
-check("ci header", has("CI / CHECKS"));
-check("ci status line", has("Some checks have not completed yet."));
-check("ci summary in progress", has("  3 in progress"));
-check("ci summary successful", has("  4 successful"));
-check("ci summary failed", has("  0 failed"));
-check("ci in-progress entry", has("  ◷ CodeQL Advanced / Analyze (javascript-typescript) (pull_request)"));
-check("ci in-progress detail", has("    Code scanning is waiting for results on commits e3e6e22 or 6ed1f2b."));
-check("ci successful entry", has("  ✓ GitGuardian Security Checks"));
-check("ci successful duration", has("    Successful in 1s"));
-check("ci successful detail", has("    No secrets detected"));
-check("ci socket 6s", has("    Successful in 6s"));
-check("ci failed none inline", has("Failed: None"));
-
-// MERGE AREA (indented reasons)
-check("merge header", has("MERGE AREA"));
-check("merge blocked", has("Merging is blocked."));
-check("merge reasons header", has("Reasons:"));
-check("merge reason change requested indented", has("  1 change requested by reviewers with write access"));
-check("merge reason checks in progress indented", has("  3 checks still in progress"));
-check("merge button disabled", has("[Merge pull request] disabled"));
+// ── Markdown quality: no triple blank lines, single H1 ──
+check("no triple newlines outside fences",
+  out.split(/```[\s\S]*?```/g).every((seg) => !seg.includes("\n\n\n")));
+check("single H1", (out.match(/^# /gm) || []).length === 1);
 
 // ─── Report ───────────────────────────────────────────────────────────────────
 
 const total = failures.length;
 if (total === 0) {
   console.log(`PASS — all assertions passed (${out.length} bytes rendered).`);
-  console.log("\n----- rendered output -----\n");
-  console.log(out);
   process.exit(0);
 } else {
   console.error(`FAIL — ${total} assertion(s) failed:`);

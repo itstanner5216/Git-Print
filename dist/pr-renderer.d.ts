@@ -191,6 +191,21 @@ export declare function fetchPRMetadata(owner: string, repo: string, pullNumber:
  * (except renderReport's deferred annotation/file-content fetches for failed checks).
  */
 export declare function fetchAllPRData(owner: string, repo: string, pullNumber: number, token: string, graphqlToken?: string): Promise<PRData>;
+/**
+ * Strip the promotional / UI cruft bots inject into comment bodies so the
+ * printout reads like clean prose: HTML comments, badge/mascot images,
+ * social-share link lists, and CodeRabbit's "Tips"/"Share" <details> footers.
+ *
+ * Content policy (the contract this function serves):
+ *   KEEP  — every word a reader sees on the PR page: prose (byte-faithful,
+ *           never escaped or reflowed), link TEXT, bare URLs the author typed,
+ *           file paths, identifiers, fenced code and diff material (untouched).
+ *   DROP  — web furniture only: link TARGETS, angle autolinks `<https://…>`
+ *           produced by the page→markdown translation, images entirely,
+ *           HTML comments, collapsed bot boilerplate, share/promo/status
+ *           lines, and whole comments that are nothing but promotion.
+ */
+export declare function cleanCommentBody(raw: string): string;
 export declare function renderPR(data: PRData, options: PRRendererOptions): Promise<void>;
 export declare function renderReport(data: PRData, options: PRRendererOptions): Promise<void>;
 /**

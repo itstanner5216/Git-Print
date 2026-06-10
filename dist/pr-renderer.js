@@ -433,24 +433,6 @@ function numberHunkRows(hunk) {
     }
     return rows;
 }
-/**
- * Render the "Code context" block GitHub shows above an inline comment: the
- * lines of the diff hunk leading up to (and including) the commented line, each
- * formatted as "<lineNum> <marker> <content>". Shows the last `max(4,rangeSize)`
- * rows to mirror GitHub's compact context window.
- */
-function formatCodeContext(diffHunk, rangeSize) {
-    const hunk = parseHunkHeader(diffHunk);
-    if (!hunk) {
-        return diffHunk.split("\n").filter(l => l && !l.startsWith("@@")).map(l => `  ${l}`);
-    }
-    const rows = numberHunkRows(hunk);
-    const shown = rows.slice(-Math.max(4, rangeSize));
-    return shown.map(r => {
-        const num = r.marker === "-" ? r.oldNum : r.newNum;
-        return `  ${num != null ? num : ""} ${r.marker} ${r.content}`;
-    });
-}
 /** Minimal line-level diff between two blocks of lines (LCS-based). */
 function diffLines(a, b) {
     const n = a.length, m = b.length;
@@ -489,51 +471,15 @@ function diffLines(a, b) {
     }
     return out;
 }
+// (The former formatCodeContext / buildSuggestionChangeset helpers were unused
+// duplicates of codeContextDiffLines / suggestionDiffBlocks; their line-number
+// and @@-header rendering now lives in those live functions.)
 /**
- * Build the "Suggested changeset" block(s) for a review comment. For each
- * ```suggestion fence in the body, produce the clean unified diff GitHub shows
- * when previewing the change: a few lines of context from the hunk, then a
- * minimal -/+ diff between the anchored original lines and the suggested
- * replacement — NOT a raw dump of the API diff hunk.
+ * Lines ready to drop inside a ```diff fence: the hunk rows GitHub anchors the
+ * comment to, each carrying its line-number gutter exactly as the PR page
+ * shows it — `155 + content` (new-file number for added/context rows, old-file
+ * number for removed rows). Numbers are right-aligned across the block.
  */
-function buildSuggestionChangeset(body, diffHunk, startLine, endLine, filePath) {
-    const suggestions = parseSuggestions(body || "", diffHunk || "", startLine, endLine);
-    if (suggestions.length === 0)
-        return [];
-    const hunk = parseHunkHeader(diffHunk || "");
-    const anchorStart = startLine ?? endLine;
-    const CONTEXT = 3;
-    const out = [];
-    for (let s = 0; s < suggestions.length; s++) {
-        const { original, replacement } = suggestions[s];
-        out.push(`Suggested changeset ${s + 1}:`);
-        out.push(`  ${filePath}`);
-        // Lines of the hunk that sit just before the anchored region become context.
-        let before = [];
-        if (hunk && anchorStart != null) {
-            before = numberHunkRows(hunk)
-                .filter(r => r.newNum != null && r.newNum < anchorStart)
-                .map(r => r.content)
-                .slice(-CONTEXT);
-        }
-        const rows = diffLines(original, replacement);
-        const oldLen = before.length + original.length;
-        const newLen = before.length + replacement.length;
-        const displayStart = anchorStart != null
-            ? Math.max(1, anchorStart - before.length)
-            : (hunk ? hunk.newStart : 1);
-        const headingSuffix = hunk && hunk.heading ? ` ${hunk.heading}` : "";
-        out.push(`  @@ -${displayStart},${oldLen} +${displayStart},${newLen} @@${headingSuffix}`);
-        for (const c of before)
-            out.push(`   ${c}`);
-        for (const row of rows) {
-            const prefix = row.type === "del" ? "-" : row.type === "add" ? "+" : " ";
-            out.push(`  ${prefix}${row.text}`);
-        }
-    }
-    return out;
-}
-/** Lines ready to drop inside a ```diff fence: the hunk rows GitHub anchors the comment to. */
 function codeContextDiffLines(diffHunk, rangeSize) {
     const hunk = parseHunkHeader(diffHunk);
     if (!hunk) {
@@ -541,11 +487,23 @@ function codeContextDiffLines(diffHunk, rangeSize) {
     }
     const rows = numberHunkRows(hunk);
     const shown = rows.slice(-Math.max(4, rangeSize));
-    return shown.map((r) => `${r.marker}${r.content}`);
+    const width = Math.max(...shown.map((r) => {
+        const num = r.marker === "-" ? r.oldNum : r.newNum;
+        return num != null ? String(num).length : 0;
+    }), 1);
+    return shown.map((r) => {
+        const num = r.marker === "-" ? r.oldNum : r.newNum;
+        const gutter = (num != null ? String(num) : "").padStart(width);
+        return `${gutter} ${r.marker} ${r.content}`.trimEnd();
+    });
 }
 /**
- * For each ```suggestion fence in a comment body, produce the -/+ diff lines
- * (plus a few lines of leading context) ready to drop inside a ```diff fence.
+ * For each ```suggestion fence in a comment body, produce the unified diff
+ * GitHub shows when previewing the change, ready to drop inside a ```diff
+ * fence: a recomputed `@@ -a,b +c,d @@` header, a few lines of leading
+ * context from the hunk, then a minimal -/+ diff between the anchored
+ * original lines and the suggested replacement — NOT a raw dump of the API
+ * diff hunk.
  */
 function suggestionDiffBlocks(body, diffHunk, startLine, endLine) {
     const suggestions = parseSuggestions(body || "", diffHunk || "", startLine, endLine);
@@ -565,6 +523,13 @@ function suggestionDiffBlocks(body, diffHunk, startLine, endLine) {
         }
         const rows = diffLines(original, replacement);
         const lines = [];
+        const oldLen = before.length + original.length;
+        const newLen = before.length + replacement.length;
+        const displayStart = anchorStart != null
+            ? Math.max(1, anchorStart - before.length)
+            : (hunk ? hunk.newStart : 1);
+        const headingSuffix = hunk && hunk.heading ? ` ${hunk.heading}` : "";
+        lines.push(`@@ -${displayStart},${oldLen} +${displayStart},${newLen} @@${headingSuffix}`);
         for (const c of before)
             lines.push(` ${c}`);
         for (const row of rows) {
@@ -594,6 +559,13 @@ function actorSuffix(user) {
     if (user.type === "Bot" || /\[bot\]$/i.test(user.login || ""))
         return " [Bot]";
     return "";
+}
+/** Display name as the PR page shows it: the literal "[bot]" suffix in a bot
+ *  login (e.g. "gemini-code-assist[bot]") is dropped — the badge comes from
+ *  actorSuffix instead, so we never print "name[bot] [Bot]". */
+function displayActor(user) {
+    const login = String(user?.login || "").replace(/\[bot\]$/i, "");
+    return `${login}${actorSuffix(user)}`;
 }
 // ─── Timeline construction ───────────────────────────────────────────────────
 function buildCards(issueComments, reviews, reviewComments, resolvedMap, includeResolved) {
@@ -665,52 +637,244 @@ function categorizeChecks(checks) {
     return { inProgress, passed, failed };
 }
 /**
+ * Run `transform` on the prose of `s` while protecting code byte-for-byte:
+ *
+ *   - Fenced blocks (``` … ```) are cut out entirely and never shown to the
+ *     transform — review diffs, suggestion bodies, and code examples must
+ *     never be altered by prose cleanup.
+ *   - Inline code spans (`…`) are replaced with inert placeholder tokens
+ *     before the transform and restored after. Tokenizing (rather than
+ *     splitting) keeps the surrounding prose CONTIGUOUS, so patterns that
+ *     straddle a code span — the very common [`file.ts`](url) link shape —
+ *     still match, while the span's contents (`[x](y)`, `<https://…>`,
+ *     `<img>`) can never be mistaken for removable debris.
+ *
+ * A token deleted by the transform (e.g. a code span inside a removed HTML
+ * comment) simply restores nothing — deletion of a protected span can only
+ * happen when its whole enclosing construct was removed.
+ *
+ * Known accepted limitations: an unclosed fence leaves its tail treated as
+ * prose, and double-backtick (``…``) spans are not recognized — both rare in
+ * PR comment bodies, with bounded failure direction.
+ */
+function transformProse(s, transform) {
+    const nonce = randomBytes(6).toString("hex");
+    return s
+        .split(/(```[\s\S]*?```)/g)
+        .map((part, i) => {
+        if (i % 2 === 1)
+            return part; // fenced block — byte-faithful
+        const spans = [];
+        // Bare alphanumeric tokens, no delimiter characters: cleanup patterns
+        // consume adjacent whitespace and punctuation, and a delimiter that got
+        // consumed would break restoration — deleting the code span and leaking
+        // token text. Plain hex with colons survives every pass untouched.
+        const tokenized = part.replace(/`[^`\n]*`/g, (m) => {
+            const token = `${nonce}:${spans.length}:`;
+            spans.push(m);
+            return token;
+        });
+        let out = transform(tokenized);
+        for (let j = 0; j < spans.length; j++) {
+            out = out.split(`${nonce}:${j}:`).join(spans[j]);
+        }
+        return out;
+    })
+        .join("");
+}
+/**
+ * Run `transform` over `s` with fenced blocks AND inline code spans replaced
+ * by inert nonce tokens (then restored). Unlike `transformProse`, the masked
+ * string stays CONTIGUOUS — so multi-line constructs that legitimately span
+ * fences (a bot `<details>` footer wrapping a ```log fence, a multi-line
+ * HTML comment) still match and are removed as one unit, fences included.
+ * A fence or code span that merely SHOWS such syntax is masked and therefore
+ * invisible to the transform — protected.
+ *
+ * Tokens whose construct was removed by the transform restore nothing: the
+ * fence belonged to the removed boilerplate and goes with it.
+ */
+function maskedTransform(s, transform) {
+    const nonce = randomBytes(6).toString("hex");
+    const stash = [];
+    const masked = s
+        .replace(/```[\s\S]*?```/g, (m) => {
+        const token = `${nonce}:${stash.length}:`;
+        stash.push(m);
+        return token;
+    })
+        .replace(/`[^`\n]*`/g, (m) => {
+        const token = `${nonce}:${stash.length}:`;
+        stash.push(m);
+        return token;
+    });
+    let out = transform(masked);
+    for (let j = 0; j < stash.length; j++) {
+        out = out.split(`${nonce}:${j}:`).join(stash[j]);
+    }
+    return out;
+}
+/**
+ * Line-level filter that only sees PROSE lines — every line inside a fenced
+ * code block is kept unconditionally. A code/diff line that happens to look
+ * like bot noise (a literal "[!NOTE]", a quoted "Thanks for using…" string)
+ * must never be dropped from inside a fence.
+ */
+function filterProseLines(s, keep) {
+    return s
+        .split(/(```[\s\S]*?```)/g)
+        .map((part, i) => i % 2 === 1 ? part : part.split("\n").filter(keep).join("\n"))
+        .join("");
+}
+/** The text of `s` with fenced-block CONTENT removed — for scanning passes
+ *  (e.g. severity extraction) that must not read code as prose. */
+function proseOnly(s) {
+    return s.split(/```[\s\S]*?```/g).join("\n");
+}
+/** A reference-definition line whose target is URL-shaped (`scheme://…`,
+ *  `mailto:`/`tel:`, `<…>`, or starting with `/`, `./`, `#`). Footnotes
+ *  (`[^1]: …`) excluded.
+ *  Prose that merely looks reference-like (`[ERROR]: timeout`) does NOT match
+ *  because `timeout` is not URL-shaped. */
+const LINK_DEF_LINE = /^[ \t]*\[(?!\^)([^\]]+)\]:[ \t]*(?:<[^>\n]*>|[a-z][a-z0-9+.-]*:\/\/\S+|(?:mailto|tel):\S+|[./#]\S*)[ \t]*(?:"[^"\n]*"|'[^'\n]*'|\([^)\n]*\))?[ \t]*$/gim;
+/**
+ * Markdown link/image debris removal — the web→markdown translation artifacts
+ * that carry no PR meaning. Fence and inline-code contents are protected
+ * internally (via transformProse); call it on the whole body.
+ *
+ * What goes, and why:
+ *   - Images (`![alt](url)`, defined `![alt][ref]`) — removed completely, alt
+ *     text included. Badges, mascots, screenshots: none of it helps a reader
+ *     address the PR.
+ *   - Angle autolinks (`<https://…>`, `<mailto:…>`) — pure translation debris;
+ *     the canonical "link populated by the webpage→markdown translation".
+ *   - Empty links (`[](url)`) — nothing visible to keep.
+ *   - Inline links (`[text](url)`) — unwrapped to `text`. The visible words
+ *     are content; the target is web furniture.
+ *   - Reference links (`[text][ref]`) — unwrapped to `text`, but ONLY when
+ *     `[ref]: url` is defined in the body (GitHub's own rendering rule); their
+ *     URL-shaped definition lines are removed.
+ *
+ * What stays, deliberately:
+ *   - Bare URLs the author typed in prose (`see https://example.com`) — a URL
+ *     standing as text is the content being discussed.
+ *   - Footnotes (`[^1]`, `[^1]: …`) — prose, not link plumbing.
+ *   - Bracket pairs without a matching definition (`arr[1][2]`, `[ERROR]: x`)
+ *     — GitHub shows them literally, so we keep them literally.
+ */
+function stripLinkDebris(body) {
+    // Pass 1 — collect defined reference labels (CommonMark matches labels
+    // case-insensitively). Collected from prose only, so a definition-shaped
+    // line inside a code example doesn't activate unwrapping.
+    const defined = new Set();
+    body.split(/(```[\s\S]*?```)/g).forEach((part, i) => {
+        if (i % 2 === 1)
+            return; // fence — definitions inside code don't count
+        for (const m of part.matchAll(LINK_DEF_LINE))
+            defined.add(m[1].trim().toLowerCase());
+    });
+    // Pass 2 — transform prose segments.
+    return transformProse(body, (seg) => {
+        let s = seg;
+        // Inline images first. (Running link-unwrap first would turn `![alt](url)`
+        // into `!alt`.) Leading whitespace is consumed so mid-sentence removal
+        // doesn't leave a double space.
+        s = s.replace(/[ \t]*!\[[^\]]*\]\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)/g, "");
+        // Reference-style images — removed only when their definition exists.
+        s = s.replace(/[ \t]*!\[([^\]]*)\]\[([^\]]*)\]/g, (full, alt, ref) => {
+            const label = (ref || alt).trim().toLowerCase();
+            return defined.has(label) ? "" : full;
+        });
+        // Angle autolinks — `<https://…>` / `<http://…>` / `<mailto:…>`.
+        s = s.replace(/[ \t]*<(?:https?|mailto):[^>\s]*>/gi, "");
+        // Empty-text links (the husk left where a badge image sat inside a link).
+        s = s.replace(/[ \t]*\[\s*\]\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)/g, "");
+        // Inline links — keep the visible text, drop the target. Tolerates up to
+        // two levels of balanced parens inside the URL (wikipedia-style).
+        s = s.replace(/\[([^\]]*)\]\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)/g, "$1");
+        // Reference links — unwrap only when defined (`[text][ref]`, `[text][]`).
+        s = s.replace(/\[([^\]]+)\]\[([^\]]*)\]/g, (full, text, ref) => {
+            const label = (ref || text).trim().toLowerCase();
+            return defined.has(label) ? text : full;
+        });
+        // Remove the URL-shaped definition lines themselves (+ their newline).
+        s = s.replace(new RegExp(LINK_DEF_LINE.source + "\\n?", "gim"), "");
+        return s;
+    });
+}
+/**
  * Strip the promotional / UI cruft bots inject into comment bodies so the
  * printout reads like clean prose: HTML comments, badge/mascot images,
  * social-share link lists, and CodeRabbit's "Tips"/"Share" <details> footers.
- * Real review prose and code suggestions are preserved.
+ *
+ * Content policy (the contract this function serves):
+ *   KEEP  — every word a reader sees on the PR page: prose (byte-faithful,
+ *           never escaped or reflowed), link TEXT, bare URLs the author typed,
+ *           file paths, identifiers, fenced code and diff material (untouched).
+ *   DROP  — web furniture only: link TARGETS, angle autolinks `<https://…>`
+ *           produced by the page→markdown translation, images entirely,
+ *           HTML comments, collapsed bot boilerplate, share/promo/status
+ *           lines, and whole comments that are nothing but promotion.
  */
-function cleanCommentBody(raw) {
+export function cleanCommentBody(raw) {
     let s = (raw || "").replace(/\r\n/g, "\n");
-    // HTML comments (bot metadata markers).
-    s = s.replace(/<!--[\s\S]*?-->/g, "");
+    // HTML comments (bot metadata markers) — invisible on the rendered PR page.
+    // Masked, not split: a multi-line comment may legitimately span a fence
+    // (removed whole), while a code example SHOWING `<!-- … -->` is protected.
+    s = maskedTransform(s, (m) => m.replace(/<!--[\s\S]*?-->/g, ""));
     // Remove ALL <details> blocks — these are the collapsible boilerplate bots
     // inject (walkthroughs, tips, share, rate-limit notices, "learnings", file
     // lists, run config). Remove innermost first to handle nesting, and tolerate
     // blockquote-prefixed tags (`> <details>`).
-    let prev;
-    do {
-        prev = s;
-        s = s.replace(/<details\b[^>]*>(?:(?!<details\b)[\s\S])*?<\/details>/gi, "");
-    } while (s !== prev);
+    // Masked, not split: bot <details> footers routinely CONTAIN fenced code
+    // (CodeRabbit walkthroughs/logs) and must be removed whole, fence included;
+    // a fence that merely SHOWS a <details> tag is masked away and survives.
+    s = maskedTransform(s, (m) => {
+        let prev;
+        do {
+            prev = m;
+            m = m.replace(/<details\b[^>]*>(?:(?!<details\b)[\s\S])*?<\/details>/gi, "");
+        } while (m !== prev);
+        return m;
+    });
     // Some bots double-escape newlines (literal "\n") in prose. Turn them into
-    // real line breaks — but never inside fenced code blocks.
-    s = s
-        .split(/(```[\s\S]*?```)/g)
-        .map((part, i) => (i % 2 === 1 ? part : part.replace(/\\n/g, "\n")))
-        .join("");
-    // Badges / mascots / emoji art, then empty-text links left behind.
-    s = s.replace(/<picture>[\s\S]*?<\/picture>/gi, "");
-    s = s.replace(/<img\b[^>]*>/gi, "");
-    s = s.replace(/!\[[^\]]*\]\([^)]*\)/g, "");
-    s = s.replace(/\[\s*\]\([^)]*\)/g, "");
-    // Light HTML → Markdown so bot summaries stay readable.
-    s = s.replace(/<a\b[^>]*>([\s\S]*?)<\/a>/gi, "$1");
-    s = s.replace(/<\/?(?:strong|b)>/gi, "**");
-    s = s.replace(/<\/?(?:em|i)>/gi, "*");
-    s = s.replace(/<code>([\s\S]*?)<\/code>/gi, (_m, x) => "`" + x.replace(/`/g, "").trim() + "`");
-    s = s.replace(/<h[1-6]>([\s\S]*?)<\/h[1-6]>/gi, (_m, x) => `\n**${x.trim()}**\n`);
-    s = s.replace(/<li>([\s\S]*?)<\/li>/gi, (_m, x) => `- ${x.trim()}\n`);
-    s = s.replace(/<br\s*\/?>/gi, "\n");
-    // Strip any remaining stray tags but keep their inner text.
-    s = s.replace(/<\/?(?:details|summary|div|span|sub|sup|p|kbd|samp|blockquote|ul|ol|li|h[1-6]|code|strong|b|em|i|hr|abbr|small|table|thead|tbody|tr|td|th)\b[^>]*>/gi, "");
+    // real line breaks — but never inside fenced code blocks or inline code
+    // spans, where "\n" is literal code.
+    s = transformProse(s, (seg) => seg.replace(/\\n/g, "\n"));
+    // Raw-HTML images — removed completely (badges, mascots, screenshots).
+    // Fence-guarded: a code example SHOWING an <img> tag keeps it.
+    s = transformProse(s, (seg) => seg
+        .replace(/[ \t]*<picture>[\s\S]*?<\/picture>/gi, "")
+        .replace(/[ \t]*<img\b[^>]*>/gi, ""));
+    // Light HTML → Markdown so bot summaries stay readable. The <a> unwrap
+    // keeps the visible text and drops the target — link text is content,
+    // the URL is web furniture. All fence-guarded.
+    s = transformProse(s, (seg) => seg
+        .replace(/[ \t]*<a\b[^>]*>\s*<\/a>/gi, "")
+        .replace(/<a\b[^>]*>([\s\S]*?)<\/a>/gi, "$1")
+        .replace(/<\/?(?:strong|b)>/gi, "**")
+        .replace(/<\/?(?:em|i)>/gi, "*")
+        .replace(/<code>([\s\S]*?)<\/code>/gi, (_m, x) => "`" + x.replace(/`/g, "").trim() + "`")
+        .replace(/<h[1-6]>([\s\S]*?)<\/h[1-6]>/gi, (_m, x) => `\n**${x.trim()}**\n`)
+        .replace(/<li>([\s\S]*?)<\/li>/gi, (_m, x) => `- ${x.trim()}\n`)
+        .replace(/<br\s*\/?>/gi, "\n"));
+    // Strip any remaining stray tags but keep their inner text. Fence-guarded.
+    s = transformProse(s, (seg) => seg.replace(/<\/?(?:details|summary|div|span|sub|sup|p|kbd|samp|blockquote|ul|ol|li|h[1-6]|code|strong|b|em|i|hr|abbr|small|table|thead|tbody|tr|td|th)\b[^>]*>/gi, ""));
     // Line-level removal of pure marketing / bot-status noise (ignoring any
     // leading blockquote `>` prefix).
+    //
+    // ORDERING CONTRACT: dropLine runs BEFORE stripLinkDebris. The share-spam
+    // pattern below identifies its line BY the markdown link target — unwrapping
+    // links first would blind it and leak "Share this:" prose into the output.
     const dropLine = (line) => {
         const t = line.replace(/^>+\s?/, "").trim();
         if (/\[[^\]]*\]\([^)]*(?:twitter\.com\/intent|x\.com\/intent|mastodon\.[^/]+\/share|reddit\.com\/submit|linkedin\.com\/sharing)/i.test(t))
             return true;
         if (/^\[!(?:note|tip|important|warning|caution)\]$/i.test(t))
+            return true;
+        if (/^copilot uses ai\.?\s*check for mistakes\.?$/i.test(t))
+            return true;
+        if (/^view reviewed changes\s*>?$/i.test(t))
             return true;
         if (/thanks for using \[?coderabbit/i.test(t))
             return true;
@@ -738,11 +902,16 @@ function cleanCommentBody(raw) {
             return true;
         return false;
     };
-    s = s.split("\n").filter((line) => !dropLine(line)).join("\n");
-    // Drop an orphaned "Share" heading.
-    s = s.replace(/^#{1,6}\s*share\b.*$/gim, "");
-    // Tidy whitespace and any blockquote lines left empty.
-    s = s.replace(/^>\s*$/gm, "").replace(/[ \t]+$/gm, "").replace(/\n{3,}/g, "\n\n").trim();
+    s = filterProseLines(s, (line) => !dropLine(line));
+    // Drop an orphaned "Share" heading. Fence-guarded.
+    s = transformProse(s, (seg) => seg.replace(/^#{1,6}\s*share\b.*$/gim, ""));
+    // Markdown link/image debris — AFTER dropLine (which matches share-spam BY
+    // its link target). Fence/inline-code protection is internal to the
+    // function. See stripLinkDebris for the full keep/drop contract.
+    s = stripLinkDebris(s);
+    // Tidy whitespace and any blockquote lines left empty — outside fences
+    // only, so code/diff bytes (trailing spaces, blank runs) stay exact.
+    s = transformProse(s, (seg) => seg.replace(/^>\s*$/gm, "").replace(/[ \t]+$/gm, "").replace(/\n{3,}/g, "\n\n")).trim();
     // Strip leading/trailing horizontal rules (e.g. coderabbit wraps its body in
     // "---"). A bare rule at the edges only collides with the section separators
     // renderPR emits, producing an ugly double "---".
@@ -761,8 +930,11 @@ export async function renderPR(data, options) {
     const { outputPath, includeResolvedThreads = true } = options;
     const cards = buildCards(issueComments, reviews, data.reviewComments, resolvedThreadMap, includeResolvedThreads);
     const out = [];
-    const w = (line = "") => out.push(line);
-    const blank = () => out.push("");
+    // Writes go to a switchable target so the Comments flow can be buffered and
+    // its heading emitted only when at least one card actually rendered.
+    let target = out;
+    const w = (line = "") => target.push(line);
+    const blank = () => target.push("");
     const state = pr.merged ? "Merged" : pr.state === "open" ? "Open" : "Closed";
     const action = pr.merged ? "merged" : pr.state === "open" ? "wants to merge" : "closed";
     // Reviewers (sidebar) — Copilot shown plain, other bots flagged "[Bot]".
@@ -776,7 +948,8 @@ export async function renderPR(data, options) {
             if (/copilot/i.test(name))
                 return name;
             const isBot = reviewer?.type === "Bot" || /\[bot\]$/i.test(name);
-            return isBot ? `${name} [Bot]` : name;
+            const display = name.replace(/\[bot\]$/i, "");
+            return isBot ? `${display} [Bot]` : display;
         })
         : ["None"];
     const assignees = pr.assignees?.length > 0 ? pr.assignees.map((a) => a.login) : ["No one"];
@@ -809,10 +982,15 @@ export async function renderPR(data, options) {
             default: return String(rawState || "reviewed").toLowerCase().replace(/_/g, " ");
         }
     };
-    // Render one inline review thread as clean Markdown: reviewer, file + anchor,
-    // a ```diff code-context block, the comment prose, then any suggested change
-    // as its own ```diff block, followed by real replies (no UI reply boxes or
-    // action buttons).
+    // A standalone "Severity: Medium" line in a bot comment body — surfaced in
+    // the thread header instead, so the duplicate body line is dropped. Only a
+    // LINE that is nothing but the severity tag matches; prose that mentions
+    // severity mid-sentence is untouched.
+    const stripSeverityLine = (body) => filterProseLines(body, (line) => !/^\s*\**\s*severity\s*:?\s*\**\s*(?:low|medium|high|critical|info|minor|major)\s*\**\s*$/i.test(line));
+    // Render one inline review thread as clean Markdown: reviewer (+ severity),
+    // file + anchor, a line-numbered ```diff code-context block, the comment
+    // prose, then any suggested change as its own numbered ```diff changeset,
+    // followed by real replies (no UI reply boxes or action buttons).
     const writeThreadMd = (thread, resolved) => {
         const root = thread.rootComment;
         const filePath = root.path;
@@ -820,7 +998,9 @@ export async function renderPR(data, options) {
         const el = root.line ?? root.original_line ?? null;
         const rangeSize = sl && el ? el - sl + 1 : 1;
         const outdatedTag = thread.isOutdated && !resolved ? " _(outdated)_" : "";
-        w(`**${root.user.login}${actorSuffix(root.user)}** reviewed · ${formatDate(root.created_at)}`);
+        const severity = extractSeverity(proseOnly(root.body || ""));
+        const severityTag = severity ? ` · Severity: ${severity}` : "";
+        w(`**${displayActor(root.user)}** reviewed · ${formatDate(root.created_at)}${severityTag}`);
         blank();
         w(`\`${filePath}\` — ${lineAnchor(root)}${outdatedTag}`);
         blank();
@@ -832,13 +1012,14 @@ export async function renderPR(data, options) {
             w("```");
             blank();
         }
-        const body = cleanCommentBody(stripSuggestionBlocks(root.body || ""));
+        const body = cleanCommentBody(stripSeverityLine(stripSuggestionBlocks(root.body || "")));
         if (body) {
             w(body);
             blank();
         }
+        let changesetNum = 1;
         for (const block of suggestionDiffBlocks(root.body || "", root.diff_hunk || "", sl, el)) {
-            w("**Suggested change:**");
+            w(`**Suggested changeset ${changesetNum++}:** \`${filePath}\``);
             w("```diff");
             for (const l of block)
                 w(l);
@@ -846,17 +1027,20 @@ export async function renderPR(data, options) {
             blank();
         }
         for (const reply of thread.replies) {
-            w(`**${reply.user.login}${actorSuffix(reply.user)}** replied · ${formatDate(reply.created_at)}`);
+            const rSeverity = extractSeverity(proseOnly(reply.body || ""));
+            const rSeverityTag = rSeverity ? ` · Severity: ${rSeverity}` : "";
+            w(`**${displayActor(reply.user)}** replied · ${formatDate(reply.created_at)}${rSeverityTag}`);
             blank();
-            const rbody = cleanCommentBody(stripSuggestionBlocks(reply.body || ""));
+            const rbody = cleanCommentBody(stripSeverityLine(stripSuggestionBlocks(reply.body || "")));
             if (rbody) {
                 w(rbody);
                 blank();
             }
             const rsl = reply.start_line ?? reply.original_start_line ?? sl;
             const rel = reply.line ?? reply.original_line ?? el;
+            let rChangesetNum = 1;
             for (const block of suggestionDiffBlocks(reply.body || "", reply.diff_hunk || root.diff_hunk || "", rsl, rel)) {
-                w("**Suggested change:**");
+                w(`**Suggested changeset ${rChangesetNum++}:** \`${reply.path || filePath}\``);
                 w("```diff");
                 for (const l of block)
                     w(l);
@@ -889,12 +1073,13 @@ export async function renderPR(data, options) {
     w(`- **Milestone:** ${milestone}`);
     w("- **Development:** No linked issues");
     // ── Comments (scroll order; resolved threads deferred to their own section) ───
-    blank();
-    w("---");
-    blank();
-    w("## Comments");
+    // Buffered: the heading prints only when a card survives cleaning — a PR
+    // whose every comment is promo-only (or purely resolved) gets no empty
+    // "## Comments" stub.
+    const commentBuf = [];
     const resolvedThreads = [];
     let n = 1;
+    target = commentBuf;
     for (const card of cards) {
         if (card.kind === "inline_thread" && card.thread && card.thread.isResolved === true) {
             resolvedThreads.push(card.thread);
@@ -910,7 +1095,7 @@ export async function renderPR(data, options) {
             body = cleanCommentBody(c.body || "");
             if (!body)
                 continue;
-            header = `**${c.user.login}${actorSuffix(c.user)}** commented · ${formatDate(c.created_at)}`;
+            header = `**${displayActor(c.user)}** commented · ${formatDate(c.created_at)}`;
         }
         else if (card.kind === "review_event") {
             const r = card.data;
@@ -919,7 +1104,7 @@ export async function renderPR(data, options) {
             const hasVerdict = verdict === "CHANGES_REQUESTED" || verdict === "APPROVED" || verdict === "DISMISSED";
             if (!body && !hasVerdict)
                 continue;
-            header = `**${r.user.login}${actorSuffix(r.user)}** ${reviewVerb(r.state)} · ${formatDate(r.submitted_at || r.created_at)}`;
+            header = `**${displayActor(r.user)}** ${reviewVerb(r.state)} · ${formatDate(r.submitted_at || r.created_at)}`;
         }
         blank();
         w(`### Comment #${n++}`);
@@ -934,6 +1119,14 @@ export async function renderPR(data, options) {
                 w(body);
             }
         }
+    }
+    target = out;
+    if (commentBuf.length > 0) {
+        blank();
+        w("---");
+        blank();
+        w("## Comments");
+        out.push(...commentBuf);
     }
     // ── Resolved threads (own section; omitted entirely when there are none) ──────
     if (resolvedThreads.length > 0) {
@@ -996,7 +1189,12 @@ export async function renderPR(data, options) {
             reasons.push(`${failed.length} check${failed.length !== 1 ? "s" : ""} failed`);
         w(reasons.length > 0 ? `**Merging is blocked** — ${reasons.join(", ")}.` : "**Merging is blocked.**");
     }
-    const output = out.join("\n").replace(/\n{3,}/g, "\n\n").replace(/\s+$/, "") + "\n";
+    const joined = out.join("\n");
+    const collapsed = joined
+        .split(/(```[\s\S]*?```)/g)
+        .map((part, i) => (i % 2 === 1 ? part : part.replace(/\n{3,}/g, "\n\n")))
+        .join("");
+    const output = collapsed.replace(/\s+$/, "") + "\n";
     await writeFile(outputPath, output, "utf-8");
     console.error(`Written review to ${outputPath} (${output.length} bytes)`);
 }

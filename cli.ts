@@ -246,10 +246,10 @@ async function main(): Promise<void> {
   // is a file, not a directory; using --git-common-dir gives us the shared
   // store where reports and temp worktrees belong.
   const commonDir = gitCommonDir(gitRoot);
-  const outputDir = join(commonDir, "pr-reviews");
+  const outputDir = join(commonDir, "Git-Print");
 
   const reviewPath = join(outputDir, `PR-${prNumber}-review.md`);
-  const reportPath = join(outputDir, `PR-${prNumber}-report.txt`);
+  const reportPath = join(outputDir, `PR-${prNumber}-report.md`);
   const conflictPath = join(outputDir, `PR-${prNumber}-conflicts.md`);
 
   const generatedPaths: string[] = [];

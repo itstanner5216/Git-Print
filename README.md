@@ -1,134 +1,190 @@
 # Git-Print
 
-**One command. The entire PR — as a clean, readable document.**
+**One command. The entire PR — exactly as a person sees it.**
 
-Git-Print takes a GitHub Pull Request and renders it into plain Markdown files that capture *everything* a reviewer sees — the conversation, the code suggestions, the CI status, the commit history, the file changes, and even the merge conflicts — stripped of all web clutter, bot spam, and UI noise.
+Git-Print is a CLI tool purpose-built for AI coding agents (and humans) that need to understand and act on a GitHub Pull Request — without the 15-minute, 20-API-call ordeal. One command produces a single, clean Markdown document that captures *everything*: every comment, every inline thread, every review, every merge conflict, every CI annotation — assembled in the exact scroll order you'd see on the GitHub PR page.
 
-## The Problem
+---
 
-Reading a Pull Request on GitHub means navigating a fragmented web interface: tabs you have to click through, collapsed threads you have to expand, bot comments drowning out real feedback, badge images, promotional footers, share links, social media spam from automated reviewers — and if you want to take it offline, print it, or feed it to another tool? There is no clean way.
+## Why This Exists
 
-**The alternatives are painful:**
+If you've ever tasked an AI agent with addressing PR review comments, you've hit the wall.
 
-- **Copy-paste from GitHub** — you get raw HTML artifacts, broken formatting, embedded images, and link destinations inlined everywhere. You lose thread structure and miss collapsed content entirely.
-- **GitHub's "print" view** — incomplete, loses code review threads, skips CI details, ignores merge conflict context.
-- **`gh pr view`** — shows you the description and maybe the diff, but not the review conversation, not the inline code threads, not the suggested changes, not the CI annotations, not the conflict regions.
-- **Export extensions/scripts** — fragile scrapers that break when GitHub changes their DOM, produce HTML soup, and miss half the data.
-- **Manual reconstruction** — opening each review thread, copying each inline comment, finding the relevant diff hunk for each suggestion, noting which threads are resolved vs. active, which checks failed and why. For a substantial PR, this takes an hour of clicking.
+GitHub's API fragments pull request data across a dozen endpoints. Inline code review comments live separately from general review comments, which live separately from issue-timeline comments, which live separately from commit-level comments. Suggested changes are embedded in a different payload format than regular inline comments. Merge conflict data doesn't exist in the API at all — you have to run a trial merge locally to find it. CI annotations live in a third location. Bot noise pollutes everything.
+
+The result: **your agent makes 15–20 API calls, ingests thousands of tokens of irrelevant metadata, and still ends up with a fragmented, out-of-order picture of what actually needs to change.**
+
+Git-Print was built because nothing like it existed. After searching for a tool that could give an agent a clean, unified PR view — and finding nothing — it was built from scratch. The output is so precise and complete that agents can address every comment and every merge conflict without a single follow-up lookup.
+
+---
 
 ## What Git-Print Does
 
-```
+```sh
 print-pr-review 42
 ```
 
-That's it. Run it from anywhere inside your repo. It auto-detects the GitHub remote, fetches all PR data via the API, and produces clean Markdown documents in your `.git/Git-Print/` directory:
+That's the entire workflow. Run it from anywhere inside your repository. Git-Print:
+
+1. Auto-detects your GitHub remote
+2. Makes all necessary API calls in parallel
+3. Writes clean, structured Markdown to `.git/Git-Print/` — invisible to `git status`, scoped to the repo
+
+**Output files:**
 
 | File | What it contains |
 |------|-----------------|
-| `PR-42-review.md` | The full conversation — every comment, every inline code review thread, every suggested change — in the exact scroll order you'd see on the GitHub PR page |
-| `PR-42-report.md` | CI status with failure details and annotations, changed files list, and full commit history |
-| `PR-42-conflicts.md` | *(only when conflicts exist)* Every conflict region with context, both sides shown, classified by type |
+| `PR-42-review.md` | Every comment, inline thread, review, and suggested change — numbered in exact scroll order, with diff context, reviewer identity, timestamps, and resolution state |
+| `PR-42-report.md` | CI check results with failure annotations and source-level markers, changed files list sorted by status, full commit history |
+| `PR-42-conflicts.md` | *(only when conflicts exist)* Every conflict region with surrounding context, both sides shown side-by-side, classified by type, with exact resolve commands |
 
-## What Makes the Output Good
+---
 
-Git-Print doesn't just dump API responses. It reconstructs the PR page as a human reads it:
+## The Agent Workflow, Before and After
 
-**Conversation fidelity** — Comments are numbered in the exact order they appear when you scroll the PR page. Review events, inline threads, and general comments are interleaved chronologically — not separated into artificial "Reviews" / "Comments" / "Inline" buckets that no one reads that way.
+### Before Git-Print
 
-**Inline thread rendering** — Each code review thread shows the reviewer, timestamp, severity (when bots provide it), the file path and line anchor, a line-numbered diff context block showing exactly what code is being discussed, the comment prose, and then each suggested change rendered as a proper unified diff with `@@ headers` — not the raw API suggestion blob.
+To give an agent full PR context:
 
-**Content policy** — Every word a human reader sees on the PR page is kept byte-faithful. Every piece of web furniture is removed:
-- Link text is kept; link targets are dropped (you're reading a document, not clicking)
-- Bare URLs the author typed in prose stay (that's content being discussed)
-- Bot promotional footers, share links, "Thanks for using X!" spam, badge images, mascot images, HTML comments, collapsed walkthrough `<details>` blocks — all gone
-- Code inside fences and inline backticks is never touched — a code example that shows `<img>` or `[link](url)` syntax is preserved literally
+- `GET /pulls/{n}` — metadata only, no comments
+- `GET /pulls/{n}/reviews` — review summaries, no inline threads
+- `GET /pulls/{n}/comments` — inline code comments, raw, out of order
+- `GET /issues/{n}/comments` — general comments, separate endpoint
+- `GET /pulls/{n}/files` — changed files and raw diffs
+- `GET /commits/{sha}/comments` — commit-level comments, another endpoint
+- Multiple `GET /check-runs` calls per commit for CI data
+- Multiple `GET /check-runs/{id}/annotations` calls for failure details
+- A local trial merge to detect conflict files
+- Manual reconstruction of thread order, diff context, and conversation flow
 
-**CI intelligence** — Failed checks don't just say "failed." Git-Print fetches annotations, pulls the relevant source lines with markers showing exactly where the error is, extracts failure-relevant log lines with context, and formats it so you can read what broke without opening a browser.
+**Result:** 15–20 API calls, thousands of tokens of irrelevant metadata, a fragmented non-chronological view, and an agent that still has to ask follow-up questions.
 
-**Conflict reporting** — When a PR has merge conflicts, Git-Print runs a trial merge in an isolated worktree, extracts every conflict region with surrounding context, classifies each one (both sides modified, one side deleted, etc.), and presents base vs. incoming side-by-side with syntax highlighting.
+### After Git-Print
 
-## Conflict Resolution
-
-Beyond reporting, Git-Print can *resolve* merge conflicts safely:
-
+```sh
+print-pr-review 42
 ```
+
+**Result:** One command. One file. Zero context bloat. Agent reads the review, addresses every comment, resolves every conflict — done.
+
+---
+
+## The Review Output: What "Clean" Actually Means
+
+The `PR-{n}-review.md` file isn't an API dump. It's a faithful reconstruction of the GitHub PR page as a human reads it — with all web furniture removed:
+
+- **Every comment in scroll order** — review events, inline threads, and general comments interleaved chronologically, numbered so agents can reference them precisely
+- **Inline thread context** — each thread includes the reviewer, the file path and line anchor, a line-numbered diff block showing exactly the code being discussed, and whether the thread is resolved or still open
+- **Suggested changes rendered** — code suggestions appear as diff blocks showing the proposed change, not as raw API payloads
+- **Bot noise stripped** — promotional footers, share links, badge images, mascots, collapsed `<details>` walkthrough blocks — gone. Human content preserved byte-faithful
+- **Link policy** — link text kept, link destinations dropped (you're reading a document, not navigating a browser). URLs the author typed in prose as content stay
+- **Code never touched** — content inside fences and inline backticks is never cleaned, even if it contains HTML or Markdown syntax
+
+---
+
+## The Merge Conflict Workflow
+
+When a PR has conflicts, Git-Print runs a trial merge in an isolated Git worktree, extracts every conflict region with surrounding context, and writes `PR-{n}-conflicts.md`. The file classifies each conflict by type (both-modified, delete/modify, binary, submodule) and includes the exact resolve commands.
+
+**Resolving conflicts is a single additional flag:**
+
+```sh
+# Accept the base branch version of one file, the incoming version of another
 print-pr-review 42 --use-baseline config.ts --use-incoming utils.ts
+
+# Auto-resolve when only one file conflicts (filename inferred automatically)
+print-pr-review 42 --use-incoming
 ```
 
-This validates the resolution in a sandbox worktree first, then applies it to your working tree and creates a proper merge commit — with safety checks:
+Resolution runs through a sandbox worktree before touching your working tree. Safety checks:
 
-- Verifies you're on the correct branch
-- Pins SHAs to catch branch movement between metadata fetch and merge
-- Supports partial resolution (resolve some files, leave others for manual work)
-- Detects typos in filenames with fuzzy matching
-- Handles file deletions, binary conflicts, and modify/delete scenarios
-- Leaves merge state intact for manual finishing when only some conflicts are resolved
+- Verifies you're on the correct branch before applying anything
+- Pins commit SHAs to catch branch movement between fetch and merge
+- Detects filename typos with fuzzy matching
+- Handles partial resolution — resolve some files, leave others for manual work
+- Leaves merge state intact for manual finishing when not all conflicts are resolved
+- Handles file deletions, binary conflicts, and modify/delete edge cases
+
+The agent reads `PR-{n}-conflicts.md`, runs one command per file, and creates a clean merge commit — without ever touching the GitHub web UI or making additional API calls.
+
+---
 
 ## Installation
 
 ```sh
-# Clone and build
 git clone https://github.com/itstanner5216/Git-Print.git
 cd Git-Print
 pnpm install
 pnpm build
-
-# Link globally (optional)
-npm link
+npm link   # makes print-pr-review available system-wide
 ```
+
+**Requirements:**
+- Node.js 18+ (native `fetch`, no polyfills needed)
+- pnpm (build toolchain)
+- Git (remote detection, conflict operations, worktree isolation)
+- A GitHub token with `repo` read access
+
+**No runtime dependencies** — zero production npm packages. Only Node.js built-ins and the GitHub REST API.
+
+---
 
 ## Usage
 
 ```sh
-# Generate review + report + conflict files for PR #42
+# Full output: review + report (+ conflicts file if applicable)
 print-pr-review 42
 
-# Only the conversation review
+# Conversation and review threads only
 print-pr-review 42 --review-only
 
-# Only the CI/commits/files report
+# CI checks, annotations, changed files, commits only
 print-pr-review 42 --report-only
 
-# Resolve conflicts (single conflicting file — filename auto-detected)
+# Resolve conflicts — accept incoming for all files (single-conflict shorthand)
 print-pr-review 42 --use-incoming
 
-# Resolve conflicts (multiple files)
+# Resolve conflicts — mix strategies across files
 print-pr-review 42 --use-baseline config.ts --use-incoming utils.ts
 
-# Specify a different directory (auto-detects repo from there)
+# Run from outside the repo directory
 print-pr-review 42 --dir /path/to/my/repo
 
-# Explicit token (otherwise reads $GITHUB_TOKEN, $GH_TOKEN, or $GITHUB_PAT)
+# Inline token (overrides environment variables)
 print-pr-review 42 --token ghp_xxx
 ```
 
 ### Output Location
 
-Files are written to `.git/Git-Print/` inside your repository's Git administrative directory. This keeps them out of your working tree, out of `git status`, and naturally scoped to the repo — but accessible from any worktree.
+Files are written to `.git/Git-Print/` — inside the Git administrative directory. This means they never appear in `git status`, never get staged or committed accidentally, and are naturally scoped to the repository. Works correctly inside Git worktrees.
 
 ### Authentication
 
-Git-Print needs a GitHub token with repo read access. It checks, in order:
+Checks in order:
 
 1. `--token` flag
-2. `$GITHUB_TOKEN` environment variable
-3. `$GH_TOKEN` environment variable
-4. `$GITHUB_PAT` environment variable
+2. `$GITHUB_TOKEN`
+3. `$GH_TOKEN`
+4. `$GITHUB_PAT`
+
+### Shell Composability
+
+stdout outputs file paths. stderr outputs progress and errors. This makes Git-Print composable in pipelines:
+
+```sh
+FILES=$(print-pr-review 42) && cat $FILES
+```
+
+---
 
 ## How It Works
 
-1. **Detect** — Finds the Git root and parses the `origin` remote to determine owner/repo (supports HTTPS, SSH, SCP-style, and authenticated URLs)
-2. **Fetch** — Parallel API calls grab the PR metadata (with mergeable status polling), commits, files, reviews, review comments, issue comments, check runs, statuses, and resolved thread state via GraphQL — all in one shot, respecting rate limits
-3. **Render** — Assembles the data into clean Markdown following the exact visual contract of the GitHub PR page, with bot noise stripped and code context rebuilt
-4. **Write** — Outputs to the Git-Print directory, cleaning up stale conflict files when mergeability changes
+1. **Detect** — Finds the Git root and parses the `origin` remote to determine owner/repo. Supports HTTPS, SSH, SCP-style, and authenticated URL formats.
+2. **Fetch** — Parallel API calls retrieve PR metadata (with mergeable-status polling), commits, file diffs, reviews, review comments, issue comments, check runs, CI annotations, and resolved thread state. Rate-limit aware — automatically waits and retries.
+3. **Render** — Assembles data into clean Markdown following the exact visual contract of the GitHub PR page. Bot noise is stripped; code context is rebuilt; thread order is reconstructed chronologically.
+4. **Write** — Outputs to `.git/Git-Print/`. Stale conflict files are cleaned up automatically when mergeability changes.
 
-## Requirements
-
-- Node.js 18+ (uses native `fetch`)
-- pnpm (for dependency installation and building)
-- Git (for repo detection, conflict operations, and worktree isolation)
-- A GitHub token with read access to the target repository
+---
 
 ## License
 

@@ -126,6 +126,7 @@ Git-Print needs a GitHub token with repo read access. It checks, in order:
 ## Requirements
 
 - Node.js 18+ (uses native `fetch`)
+- pnpm (for dependency installation and building)
 - Git (for repo detection, conflict operations, and worktree isolation)
 - A GitHub token with read access to the target repository
 

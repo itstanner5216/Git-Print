@@ -17,11 +17,14 @@ import { mkdir, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { fetchAllPRData, fetchPRMetadata, renderPR, renderReport, renderConflicts, resolveConflicts, extractConflicts, gitCommonDir, } from "./pr-renderer.js";
+import { addRepo, addWorktree, remove as removeConfig, list as listConfig, resolve as resolveAlias, } from "./config.js";
 function parseArgs() {
     const args = process.argv.slice(2);
     let prNumber = null;
     let token = null;
     let dir = process.cwd();
+    let repo = null;
+    let worktree = null;
     let reviewOnly = false;
     let reportOnly = false;
     const resolutions = new Map();
@@ -34,6 +37,12 @@ function parseArgs() {
         }
         else if (arg === "--dir" && i + 1 < args.length) {
             dir = args[++i];
+        }
+        else if (arg === "--repo" && i + 1 < args.length) {
+            repo = args[++i];
+        }
+        else if (arg === "--worktree" && i + 1 < args.length) {
+            worktree = args[++i];
         }
         else if (arg === "--review-only") {
             reviewOnly = true;
@@ -75,6 +84,16 @@ function parseArgs() {
         printUsage();
         process.exit(1);
     }
+    // Resolve --repo / --worktree into a directory path
+    if (repo) {
+        try {
+            dir = resolveAlias(repo, worktree ?? undefined);
+        }
+        catch (e) {
+            console.error(`Error: ${e.message}`);
+            process.exit(1);
+        }
+    }
     // Resolve token: --token > $GITHUB_TOKEN > $GH_TOKEN > $GITHUB_PAT
     if (!token) {
         token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_PAT || null;
@@ -83,20 +102,33 @@ function parseArgs() {
         console.error("Error: No GitHub token found. Provide --token or set GITHUB_TOKEN, GH_TOKEN, or GITHUB_PAT.");
         process.exit(1);
     }
-    return { prNumber, token, dir, reviewOnly, reportOnly, resolutions, bareBaseline, bareIncoming };
+    return { prNumber, token, dir, repo, worktree, reviewOnly, reportOnly, resolutions, bareBaseline, bareIncoming };
 }
 function printUsage() {
     console.error(`
 Usage: print-pr-review <pr-number> [options]
+       print-pr-review add <alias> [path]
+       print-pr-review add <alias>/<worktree> [path]
+       print-pr-review list
+       print-pr-review remove <alias|alias/worktree>
 
 Options:
   --token <token>          GitHub personal access token (default: $GITHUB_TOKEN or $GH_TOKEN)
   --dir <path>             Directory to detect git repo from (default: cwd)
+  --repo <alias>           Use a registered repo alias instead of --dir
+  --worktree <name>        Use a named worktree within --repo
   --review-only            Only generate the conversation review file
   --report-only            Only generate the CI/commits/files report
   --use-baseline <file>    Resolve conflicts in <file> using the base branch version (repeatable)
   --use-incoming <file>    Resolve conflicts in <file> using the PR branch version (repeatable)
   -h, --help               Show this help message
+
+Repo aliases:
+  print-pr-review add zenith-mcp /path/to/repo   Register a repo alias
+  print-pr-review add zenith-mcp                  Auto-detect path from cwd
+  print-pr-review add zenith-mcp/pr23-test /wt    Register a worktree
+  print-pr-review list                            Show all registered repos
+  print-pr-review remove zenith-mcp              Remove repo + its worktrees
 
 Conflict resolution:
   When --use-baseline or --use-incoming flags are present, the tool runs the
@@ -199,9 +231,260 @@ function getGitHubRemote(gitRoot) {
     }
     return parsed;
 }
+// ─── Subcommand handler ─────────────────────────────────────────────────────
+/**
+ * Handle config subcommands (add / list / remove) and exit.
+ * Called before parseArgs() so these commands never need a PR number or token.
+ */
+function runSubcommand(args) {
+    const [sub, ...rest] = args;
+    if (sub === "list") {
+        listConfig();
+        process.exit(0);
+    }
+    if (sub === "remove") {
+        const target = rest[0];
+        if (!target) {
+            console.error("Usage: print-pr-review remove <alias> | <alias>/<worktree>");
+            process.exit(1);
+        }
+        try {
+            removeConfig(target);
+        }
+        catch (e) {
+            console.error(`Error: ${e.message}`);
+            process.exit(1);
+        }
+        process.exit(0);
+    }
+    if (sub === "add") {
+        // Formats:
+        //   add <alias> [path]          → register repo
+        //   add <alias>/<name> [path]   → register worktree
+        const target = rest[0];
+        const explicitPath = rest[1]; // may be undefined → auto-detect
+        if (!target) {
+            console.error("Usage: print-pr-review add <alias> [path]");
+            console.error("       print-pr-review add <alias>/<worktree> [path]");
+            process.exit(1);
+        }
+        const slashIdx = target.indexOf("/");
+        try {
+            if (slashIdx !== -1) {
+                const alias = target.slice(0, slashIdx);
+                const wtName = target.slice(slashIdx + 1);
+                if (!wtName) {
+                    console.error(`Error: Missing worktree name after '/'. Example: add ${alias}/my-branch`);
+                    process.exit(1);
+                }
+                addWorktree(alias, wtName, explicitPath);
+            }
+            else {
+                addRepo(target, explicitPath);
+            }
+        }
+        catch (e) {
+            console.error(`Error: ${e.message}`);
+            process.exit(1);
+        }
+        process.exit(0);
+    }
+}
+// ─── Local conflict detection ─────────────────────────────────────────────────
+/**
+ * Check whether the given directory has unresolved merge conflict markers
+ * in the working tree. Uses `git diff --name-only --diff-filter=U`.
+ * Returns the list of conflicting file paths, or an empty array if none.
+ */
+function detectLocalConflicts(dir) {
+    try {
+        const out = execSync("git diff --name-only --diff-filter=U", {
+            cwd: dir,
+            encoding: "utf-8",
+            stdio: ["pipe", "pipe", "pipe"],
+        }).trim();
+        return out ? out.split("\n").filter(Boolean) : [];
+    }
+    catch {
+        return [];
+    }
+}
+/**
+ * Minimal conflict marker parser — parses `<<<<<<<` / `=======` / `>>>>>>>`
+ * blocks from a file's content. Handles optional 3-way ancestor markers (`|||||||`).
+ */
+function extractRegionsFromContent(content) {
+    const CONTEXT = 3;
+    const lines = content.split("\n");
+    const regions = [];
+    let i = 0;
+    while (i < lines.length) {
+        if (!lines[i].startsWith("<<<<<<< ")) {
+            i++;
+            continue;
+        }
+        const startLine = i + 1; // 1-indexed
+        const baseLines = [];
+        const ancestorLines = [];
+        const incomingLines = [];
+        let hasAncestor = false;
+        let phase = "base";
+        let endLine = i;
+        i++;
+        while (i < lines.length) {
+            const line = lines[i];
+            if (line.startsWith("||||||| ")) {
+                hasAncestor = true;
+                phase = "ancestor";
+            }
+            else if (line === "=======") {
+                phase = "incoming";
+            }
+            else if (line.startsWith(">>>>>>> ")) {
+                endLine = i + 1; // 1-indexed
+                i++;
+                break;
+            }
+            else {
+                if (phase === "base")
+                    baseLines.push(line);
+                else if (phase === "ancestor")
+                    ancestorLines.push(line);
+                else
+                    incomingLines.push(line);
+            }
+            i++;
+        }
+        const ctxBeforeStart = Math.max(0, startLine - 1 - CONTEXT);
+        const ctxAfterEnd = Math.min(lines.length, endLine + CONTEXT);
+        regions.push({
+            startLine,
+            endLine,
+            baseContent: baseLines.join("\n"),
+            incomingContent: incomingLines.join("\n"),
+            ancestorContent: hasAncestor ? ancestorLines.join("\n") : undefined,
+            contextBefore: lines.slice(ctxBeforeStart, startLine - 1),
+            contextAfter: lines.slice(endLine, ctxAfterEnd),
+        });
+    }
+    return regions;
+}
+/**
+ * Render a local-conflict markdown report directly from working-tree files.
+ * This is the local-state equivalent of renderConflicts() — fires when
+ * git diff shows unmerged files regardless of GitHub's pr.mergeable value.
+ */
+async function renderLocalConflicts(dir, conflictPaths, outputPath, prNumber, context) {
+    const { readFileSync, statSync } = await import("node:fs");
+    const { writeFile } = await import("node:fs/promises");
+    const files = [];
+    for (const relPath of conflictPaths) {
+        const fullPath = join(dir, relPath);
+        try {
+            const stat = statSync(fullPath);
+            if (stat.size > 512_000) {
+                files.push({ path: relPath, regions: [], oversized: true });
+                continue;
+            }
+            const content = readFileSync(fullPath, "utf-8");
+            files.push({ path: relPath, regions: extractRegionsFromContent(content), oversized: false });
+        }
+        catch {
+            files.push({ path: relPath, regions: [], oversized: false });
+        }
+    }
+    const totalRegions = files.reduce((s, f) => s + f.regions.length, 0);
+    const out = [];
+    const w = (line = "") => out.push(line);
+    w(`# ⚠ Merge Conflicts — PR #${prNumber}`);
+    w();
+    w(`\`${context.headBranch}\` cannot merge cleanly into \`${context.baseBranch}\``);
+    w();
+    w(`${files.length} conflicting file${files.length !== 1 ? "s" : ""} · ${totalRegions} conflict region${totalRegions !== 1 ? "s" : ""}`);
+    w();
+    w(`> **Source:** local working-tree conflict markers in \`${dir}\``);
+    w();
+    w("---");
+    const langMap = {
+        ts: "typescript", js: "javascript", py: "python", rs: "rust",
+        go: "go", java: "java", kt: "kotlin", swift: "swift",
+        cpp: "cpp", c: "c", cs: "csharp", rb: "ruby",
+        md: "markdown", json: "json", yaml: "yaml", toml: "toml",
+        sh: "bash", bash: "bash", zsh: "bash",
+    };
+    const langFor = (p) => langMap[p.split(".").pop() ?? ""] ?? "";
+    for (const file of files) {
+        const regionCount = file.oversized ? "⚠ oversized" : `${file.regions.length} conflict${file.regions.length !== 1 ? "s" : ""}`;
+        w();
+        w(`## 📁 ${file.path}  ·  ${regionCount}`);
+        w();
+        if (file.oversized) {
+            w("> File exceeds 500KB — content not shown.");
+            w();
+            continue;
+        }
+        if (file.regions.length === 0) {
+            w("> Binary or deleted-vs-modified conflict — no inline markers.");
+            w();
+            continue;
+        }
+        const lang = langFor(file.path);
+        for (let r = 0; r < file.regions.length; r++) {
+            const region = file.regions[r];
+            w(`### Conflict ${r + 1} of ${file.regions.length} — Lines ${region.startLine}–${region.endLine}`);
+            w();
+            // Classify
+            const baseEmpty = region.baseContent.trim() === "";
+            const incomingEmpty = region.incomingContent.trim() === "";
+            if (baseEmpty && !incomingEmpty)
+                w("> 🟢 Addition — incoming adds new content, baseline has nothing here.");
+            else if (!baseEmpty && incomingEmpty)
+                w("> 🔴 Deletion — incoming removes content present in baseline.");
+            else if (region.ancestorContent !== undefined)
+                w("> ⚡ Both modified — baseline and incoming both changed from the common ancestor.");
+            else
+                w("> ✏️ Both modified — baseline and incoming differ.");
+            w();
+            if (region.contextBefore.length > 0) {
+                w("Context:");
+                w("```");
+                for (const cl of region.contextBefore)
+                    w(cl);
+                w("```");
+                w();
+            }
+            w(`**⬅ BASELINE** (\`${context.baseBranch}\`):`);
+            w("```" + lang);
+            w(region.baseContent);
+            w("```");
+            w();
+            if (region.ancestorContent !== undefined) {
+                w(`**ANCESTOR** (common):`);
+                w("```" + lang);
+                w(region.ancestorContent);
+                w("```");
+                w();
+            }
+            w(`**➡ INCOMING** (\`${context.headBranch}\`):`);
+            w("```" + lang);
+            w(region.incomingContent);
+            w("```");
+            if (region.contextAfter.length > 0) {
+                w();
+                w("```");
+                for (const cl of region.contextAfter)
+                    w(cl);
+                w("```");
+            }
+            w();
+        }
+    }
+    await writeFile(outputPath, out.join("\n"), "utf-8");
+    return outputPath;
+}
 // ─── Main ────────────────────────────────────────────────────────────────────
 async function main() {
-    const { prNumber, token, dir, reviewOnly, reportOnly, resolutions, bareBaseline, bareIncoming, } = parseArgs();
+    const { prNumber, token, dir, repo: _repo, worktree: _worktree, reviewOnly, reportOnly, resolutions, bareBaseline, bareIncoming, } = parseArgs();
     const isResolveMode = resolutions.size > 0 || bareBaseline || bareIncoming;
     // Git detection
     const gitRoot = getGitRoot(dir);
@@ -328,8 +611,25 @@ async function main() {
             await renderReport(data, { ...baseOptions, outputPath: reportPath });
             generatedPaths.push(reportPath);
         }
-        // Auto-detect conflicts and generate conflict report
-        if (pr.mergeable === false && pr.mergeable_state === "dirty") {
+        // Auto-detect conflicts — LOCAL state first, GitHub API as fallback
+        // This is the key design: git-print works from whatever worktree you're in,
+        // regardless of GitHub's pr.mergeable field.
+        const localConflicts = detectLocalConflicts(dir);
+        if (localConflicts.length > 0) {
+            // Local working-tree has unresolved conflict markers — render directly
+            // without a trial merge. This fires from any conflicted worktree.
+            console.error(`\n⚠ Local merge conflicts detected in ${dir}`);
+            for (const f of localConflicts)
+                console.error(`  • ${f}`);
+            const baseBranch = pr.base?.ref ?? "base";
+            const headBranch = pr.head?.ref ?? "head";
+            await ensureOutputDir();
+            const cPath = await renderLocalConflicts(dir, localConflicts, conflictPath, prNumber, { baseBranch, headBranch });
+            generatedPaths.push(cPath);
+            console.error(`Written conflict report to PR-${prNumber}-conflicts.md`);
+        }
+        else if (pr.mergeable === false && pr.mergeable_state === "dirty") {
+            // No local conflicts but GitHub says the PR is dirty — run a trial merge
             const cPath = await renderConflicts(data, {
                 ...baseOptions,
                 outputPath: conflictPath,
@@ -344,7 +644,7 @@ async function main() {
             console.error(`⚠ GitHub hasn't computed merge status yet. Skipping conflict report.`);
         }
         else {
-            // No conflicts — clean up stale conflict file if it exists
+            // No conflicts anywhere — clean up stale conflict file if it exists
             if (existsSync(conflictPath)) {
                 try {
                     await unlink(conflictPath);
@@ -371,8 +671,16 @@ const isEntry = (() => {
     }
 })();
 if (isEntry) {
-    main().catch((e) => {
-        console.error(`Fatal: ${e.message}`);
-        process.exit(1);
-    });
+    const args = process.argv.slice(2);
+    const sub = args[0];
+    // Route config subcommands before anything else — they don’t need a PR number or token
+    if (sub === "add" || sub === "list" || sub === "remove") {
+        runSubcommand(args);
+    }
+    else {
+        main().catch((e) => {
+            console.error(`Fatal: ${e.message}`);
+            process.exit(1);
+        });
+    }
 }

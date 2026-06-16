@@ -11,5 +11,5 @@
     "declaration": true,
     "sourceMap": false
   },
-  "include": ["pr-renderer.ts", "cli.ts"]
+  "include": ["pr-renderer.ts", "cli.ts", "config.ts"]
 }

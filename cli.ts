@@ -218,6 +218,16 @@ function getGitRoot(fromDir: string): string {
   }
 }
 
+function getOutputDir(gitRoot: string): string {
+  const gitDir = execSync("git rev-parse --path-format=absolute --git-dir", {
+    cwd: gitRoot, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"],
+  }).trim();
+  const commonDir = gitCommonDir(gitRoot);
+  return gitDir !== commonDir
+    ? join(gitRoot, ".git-print")   // worktree
+    : join(commonDir, "Git-Print"); // main repo
+}
+
 function getCurrentBranch(fromDir: string): string | null {
   try {
     return execSync("git branch --show-current", {
@@ -624,8 +634,7 @@ async function main(): Promise<void> {
   // Resolve the administrative Git directory. In a linked worktree, <root>/.git
   // is a file, not a directory; using --git-common-dir gives us the shared
   // store where reports and temp worktrees belong.
-  const commonDir = gitCommonDir(gitRoot);
-  const outputDir = join(commonDir, "Git-Print");
+  const outputDir = getOutputDir(gitRoot);
 
   const reviewPath = join(outputDir, `PR-${prNumber}-review.md`);
   const reportPath = join(outputDir, `PR-${prNumber}-report.md`);
@@ -858,8 +867,7 @@ async function runAuto(): Promise<void> {
   let remote: { owner: string; repo: string } | null = null;
   try { remote = getGitHubRemote(gitRoot); } catch { /* no GitHub remote */ }
 
-  const commonDir = gitCommonDir(gitRoot);
-  const outputDir = join(commonDir, "Git-Print");
+  const outputDir = getOutputDir(gitRoot);
   await mkdir(outputDir, { recursive: true });
 
   let prNumber: number | null = null;
@@ -903,6 +911,28 @@ async function runAuto(): Promise<void> {
 
 const HOOK_NAME = "git-print-conflicts";
 
+function addToGlobalGitignore(entry: string): void {
+  let ignorePath: string;
+  try {
+    ignorePath = execSync("git config --global core.excludesFile", {
+      encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+  } catch { ignorePath = ""; }
+
+  if (!ignorePath) {
+    ignorePath = join(process.env.HOME ?? "~", ".gitignore_global");
+    execSync(`git config --global core.excludesFile "${ignorePath}"`, { stdio: "inherit" });
+  }
+
+  const existing = existsSync(ignorePath) ? readFileSync(ignorePath, "utf-8") : "";
+  if (existing.split("\n").some(l => l.trim() === entry.trim())) {
+    console.log(`✓  ${entry} already in ${ignorePath}`);
+    return;
+  }
+  writeFileSync(ignorePath, existing.trimEnd() + `\n${entry}\n`);
+  console.log(`✓  Added ${entry} to ${ignorePath}`);
+}
+
 function runInstall(): void {
   const { major, minor } = getGitVersion();
   const hasConfigHooks = major > 2 || (major === 2 && minor >= 54);
@@ -915,7 +945,7 @@ function runInstall(): void {
     console.log(`   Uninstall: git-print uninstall`);
   } else {
     const gitRoot  = getGitRoot(process.cwd());
-    const hookPath = join(gitRoot, ".git", "hooks", "pre-push");
+    const hookPath = join(gitCommonDir(gitRoot), "hooks", "pre-push");
     // readFileSync, writeFileSync, chmodSync imported at top
     const marker   = "# git-print auto";
 
@@ -932,6 +962,9 @@ function runInstall(): void {
     console.log(`   (git 2.54+ supports a cleaner global config-based hook)`);
     console.log(`   Uninstall: git-print uninstall`);
   }
+
+  // Add .git-print/ to global gitignore so worktree output dirs are never tracked
+  addToGlobalGitignore(".git-print/");
 }
 
 function runUninstall(): void {
@@ -945,7 +978,7 @@ function runUninstall(): void {
     } catch { console.log(`Nothing to remove — hook not found in ~/.gitconfig`); }
   } else {
     const gitRoot  = getGitRoot(process.cwd());
-    const hookPath = join(gitRoot, ".git", "hooks", "pre-push");
+    const hookPath = join(gitCommonDir(gitRoot), "hooks", "pre-push");
     if (!existsSync(hookPath)) { console.log(`Nothing to remove — no pre-push hook found`); return; }
     // readFileSync, writeFileSync imported at top
     const filtered = (readFileSync(hookPath, "utf-8") as string)

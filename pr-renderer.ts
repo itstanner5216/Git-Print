@@ -2283,7 +2283,7 @@ export async function renderConflicts(
     .map(f => `--use-incoming ${f.path}`)
     .join(" ");
   w("```bash");
-  w(`print-pr-review ${pullNumber} ${fileArgs}`);
+  w(`git-print ${pullNumber} ${fileArgs}`);
   w("```");
   w();
 

@@ -18,11 +18,11 @@
  *   auto-discover-worktrees: enabled
  *
  * Commands:
- *   print-pr-review add <alias> [path]         — register a repo (auto-detect path if omitted)
- *   print-pr-review add <alias>/<wt> [path]    — register a worktree
- *   print-pr-review list                        — show all registered repos + worktrees
- *   print-pr-review remove <alias>             — remove a repo + its worktrees
- *   print-pr-review remove <alias>/<wt>        — remove a single worktree
+ *   git-print add <alias> [path]         — register a repo (auto-detect path if omitted)
+ *   git-print add <alias>/<wt> [path]    — register a worktree
+ *   git-print list                        — show all registered repos + worktrees
+ *   git-print remove <alias>             — remove a repo + its worktrees
+ *   git-print remove <alias>/<wt>        — remove a single worktree
  */
 export declare function configPath(): string;
 export declare function detectRepoRoot(fromDir?: string): string | null;

@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * cli.ts — print-pr-review CLI
+ * cli.ts — git-print CLI
  *
  * Usage:
- *   print-pr-review <pr-number> [--token <token>] [--dir <path>]
+ *   git-print <pr-number> [--token <token>] [--dir <path>]
  *                   [--review-only] [--report-only]
  *                   [--use-baseline <file>...] [--use-incoming <file>...]
  *
@@ -106,11 +106,11 @@ function parseArgs() {
 }
 function printUsage() {
     console.error(`
-Usage: print-pr-review <pr-number> [options]
-       print-pr-review add <alias> [path]
-       print-pr-review add <alias>/<worktree> [path]
-       print-pr-review list
-       print-pr-review remove <alias|alias/worktree>
+Usage: git-print <pr-number> [options]
+       git-print add <alias> [path]
+       git-print add <alias>/<worktree> [path]
+       git-print list
+       git-print remove <alias|alias/worktree>
 
 Options:
   --token <token>          GitHub personal access token (default: $GITHUB_TOKEN or $GH_TOKEN)
@@ -124,11 +124,11 @@ Options:
   -h, --help               Show this help message
 
 Repo aliases:
-  print-pr-review add zenith-mcp /path/to/repo   Register a repo alias
-  print-pr-review add zenith-mcp                  Auto-detect path from cwd
-  print-pr-review add zenith-mcp/pr23-test /wt    Register a worktree
-  print-pr-review list                            Show all registered repos
-  print-pr-review remove zenith-mcp              Remove repo + its worktrees
+  git-print add zenith-mcp /path/to/repo   Register a repo alias
+  git-print add zenith-mcp                  Auto-detect path from cwd
+  git-print add zenith-mcp/pr23-test /wt    Register a worktree
+  git-print list                            Show all registered repos
+  git-print remove zenith-mcp              Remove repo + its worktrees
 
 Conflict resolution:
   When --use-baseline or --use-incoming flags are present, the tool runs the
@@ -245,7 +245,7 @@ function runSubcommand(args) {
     if (sub === "remove") {
         const target = rest[0];
         if (!target) {
-            console.error("Usage: print-pr-review remove <alias> | <alias>/<worktree>");
+            console.error("Usage: git-print remove <alias> | <alias>/<worktree>");
             process.exit(1);
         }
         try {
@@ -264,8 +264,8 @@ function runSubcommand(args) {
         const target = rest[0];
         const explicitPath = rest[1]; // may be undefined → auto-detect
         if (!target) {
-            console.error("Usage: print-pr-review add <alias> [path]");
-            console.error("       print-pr-review add <alias>/<worktree> [path]");
+            console.error("Usage: git-print add <alias> [path]");
+            console.error("       git-print add <alias>/<worktree> [path]");
             process.exit(1);
         }
         const slashIdx = target.indexOf("/");
@@ -540,7 +540,7 @@ async function main() {
             if (bareBaseline && bareIncoming) {
                 console.error(`✗ Both --use-baseline and --use-incoming specified without filenames — contradictory.`);
                 console.error(`  Specify a filename with each flag, e.g.:`);
-                console.error(`  print-pr-review ${prNumber} --use-baseline file1 --use-incoming file2`);
+                console.error(`  git-print ${prNumber} --use-baseline file1 --use-incoming file2`);
                 process.exit(1);
             }
             // Need to figure out which files conflict
@@ -567,7 +567,7 @@ async function main() {
                 for (const f of conflictPaths) {
                     console.error(`  ${f}`);
                 }
-                console.error(`\nExample: print-pr-review ${prNumber} --use-baseline ${conflictPaths[0]} --use-incoming ${conflictPaths[1]}`);
+                console.error(`\nExample: git-print ${prNumber} --use-baseline ${conflictPaths[0]} --use-incoming ${conflictPaths[1]}`);
                 process.exit(1);
             }
         }

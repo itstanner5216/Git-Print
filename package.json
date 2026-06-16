@@ -1,11 +1,11 @@
 {
-  "name": "print-pr-review",
+  "name": "git-print",
   "version": "1.0.0",
   "description": "Render GitHub PR conversation and CI/commits/files report as plain text",
   "type": "module",
   "main": "dist/pr-renderer.js",
   "bin": {
-    "print-pr-review": "./dist/cli.js"
+    "git-print": "./dist/cli.js"
   },
   "scripts": {
     "build": "tsc",

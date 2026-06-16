@@ -18,11 +18,11 @@
  *   auto-discover-worktrees: enabled
  *
  * Commands:
- *   print-pr-review add <alias> [path]         — register a repo (auto-detect path if omitted)
- *   print-pr-review add <alias>/<wt> [path]    — register a worktree
- *   print-pr-review list                        — show all registered repos + worktrees
- *   print-pr-review remove <alias>             — remove a repo + its worktrees
- *   print-pr-review remove <alias>/<wt>        — remove a single worktree
+ *   git-print add <alias> [path]         — register a repo (auto-detect path if omitted)
+ *   git-print add <alias>/<wt> [path]    — register a worktree
+ *   git-print list                        — show all registered repos + worktrees
+ *   git-print remove <alias>             — remove a repo + its worktrees
+ *   git-print remove <alias>/<wt>        — remove a single worktree
  */
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
@@ -238,7 +238,7 @@ export function addWorktree(alias: string, worktreeName: string, wtPath?: string
   const entries = read();
   // Ensure the repo exists
   const repoPath = getKV(entries, "Repos", alias);
-  if (!repoPath) throw new Error(`Repo "${alias}" not registered. Run: print-pr-review add ${alias} <path>`);
+  if (!repoPath) throw new Error(`Repo "${alias}" not registered. Run: git-print add ${alias} <path>`);
 
   setKV(entries, "Worktrees", key, path);
   write(entries);
@@ -290,11 +290,11 @@ export function resolve(alias: string, worktreeName?: string): string {
         if (match) return match.path;
       }
     }
-    throw new Error(`Worktree "${alias}/${worktreeName}" not found. Run: print-pr-review add ${alias}/${worktreeName} <path>`);
+    throw new Error(`Worktree "${alias}/${worktreeName}" not found. Run: git-print add ${alias}/${worktreeName} <path>`);
   }
 
   const path = getKV(entries, "Repos", alias);
-  if (!path) throw new Error(`Repo "${alias}" not registered. Run: print-pr-review add ${alias} <path>`);
+  if (!path) throw new Error(`Repo "${alias}" not registered. Run: git-print add ${alias} <path>`);
   return path;
 }
 
@@ -307,7 +307,7 @@ export function list(): void {
   const autoDiscover = settings.find(s => s.key === "auto-discover-worktrees")?.value === "enabled";
 
   if (repos.length === 0) {
-    console.log("No repos registered yet.\nRun: print-pr-review add <alias> <path>");
+    console.log("No repos registered yet.\nRun: git-print add <alias> <path>");
     return;
   }
 

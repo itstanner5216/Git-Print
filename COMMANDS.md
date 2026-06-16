@@ -20,7 +20,7 @@
 - [ ] **Link the binary globally** *(optional, one-time)*
   ```bash
   npm link
-  # makes `print-pr-review` available system-wide
+  # makes `git-print` available system-wide
   ```
 
 - [ ] **Set your GitHub token** *(required)*
@@ -35,36 +35,36 @@
 
 - [ ] **Generate both output files** *(default mode)*
   ```bash
-  print-pr-review 42
+  git-print 42
   # → .git/Git-Print/PR-42-review.md   (full conversation)
   # → .git/Git-Print/PR-42-report.md   (CI checks, commits, changed files)
   ```
 
 - [ ] **Review file only** — conversation, comments, metadata
   ```bash
-  print-pr-review 42 --review-only
+  git-print 42 --review-only
   # → PR-42-review.md
   ```
 
 - [ ] **Report file only** — CI checks, failure annotations, file list, commits
   ```bash
-  print-pr-review 42 --report-only
+  git-print 42 --report-only
   # → PR-42-report.md
   ```
 
 - [ ] **Pass token inline** *(overrides env var)*
   ```bash
-  print-pr-review 42 --token ghp_yourTokenHere
+  git-print 42 --token ghp_yourTokenHere
   ```
 
 - [ ] **Run from a different directory** *(useful in scripts)*
   ```bash
-  print-pr-review 42 --dir /path/to/your/repo
+  git-print 42 --dir /path/to/your/repo
   ```
 
 - [ ] **Show help**
   ```bash
-  print-pr-review --help
+  git-print --help
   ```
 
 ---
@@ -76,29 +76,29 @@
 
 - [ ] **Accept the base branch version of a file**
   ```bash
-  print-pr-review 42 --use-baseline src/config.ts
+  git-print 42 --use-baseline src/config.ts
   ```
 
 - [ ] **Accept the PR's incoming version of a file**
   ```bash
-  print-pr-review 42 --use-incoming src/utils.ts
+  git-print 42 --use-incoming src/utils.ts
   ```
 
 - [ ] **Mix strategies — resolve multiple files in one command**
   ```bash
-  print-pr-review 42 --use-baseline src/config.ts --use-incoming src/utils.ts
+  git-print 42 --use-baseline src/config.ts --use-incoming src/utils.ts
   ```
 
 - [ ] **Auto-resolve when only one file conflicts** *(omit the filename)*
   ```bash
-  print-pr-review 42 --use-incoming
+  git-print 42 --use-incoming
   # or
-  print-pr-review 42 --use-baseline
+  git-print 42 --use-baseline
   ```
 
 - [ ] **Resolve conflicts AND generate output files**
   ```bash
-  print-pr-review 42 --use-incoming src/utils.ts --review-only
+  git-print 42 --use-incoming src/utils.ts --review-only
   ```
 
 > **Resolution safety:** Changes are validated in a sandboxed git worktree first.  
@@ -172,6 +172,6 @@ Git-Print looks for your GitHub token in this order:
 - **Rate limit aware:** automatically waits and retries when GitHub rate limit is near
 - **stdout = file paths, stderr = progress/errors** — composable in shell pipelines:
   ```bash
-  FILES=$(print-pr-review 42) && cat $FILES
+  FILES=$(git-print 42) && cat $FILES
   ```
 - **No runtime dependencies** — zero production npm packages; only Node.js built-ins and the GitHub API

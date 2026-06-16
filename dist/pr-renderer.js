@@ -1864,7 +1864,7 @@ export async function renderConflicts(data, options) {
         .map(f => `--use-incoming ${f.path}`)
         .join(" ");
     w("```bash");
-    w(`print-pr-review ${pullNumber} ${fileArgs}`);
+    w(`git-print ${pullNumber} ${fileArgs}`);
     w("```");
     w();
     const output = out.join("\n");

@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * cli.ts — print-pr-review CLI
+ * cli.ts — git-print CLI
  *
  * Usage:
- *   print-pr-review <pr-number> [--token <token>] [--dir <path>]
+ *   git-print <pr-number> [--token <token>] [--dir <path>]
  *                   [--review-only] [--report-only]
  *                   [--use-baseline <file>...] [--use-incoming <file>...]
  *

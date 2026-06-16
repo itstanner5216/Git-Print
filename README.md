@@ -21,7 +21,7 @@ Git-Print was built because nothing like it existed. After searching for a tool 
 ## What Git-Print Does
 
 ```sh
-print-pr-review 42
+git-print 42
 ```
 
 That's the entire workflow. Run it from anywhere inside your repository. Git-Print:
@@ -62,7 +62,7 @@ To give an agent full PR context:
 ### After Git-Print
 
 ```sh
-print-pr-review 42
+git-print 42
 ```
 
 **Result:** One command. One file. Zero context bloat. Agent reads the review, addresses every comment, resolves every conflict — done.
@@ -90,10 +90,10 @@ When a PR has conflicts, Git-Print runs a trial merge in an isolated Git worktre
 
 ```sh
 # Accept the base branch version of one file, the incoming version of another
-print-pr-review 42 --use-baseline config.ts --use-incoming utils.ts
+git-print 42 --use-baseline config.ts --use-incoming utils.ts
 
 # Auto-resolve when only one file conflicts (filename inferred automatically)
-print-pr-review 42 --use-incoming
+git-print 42 --use-incoming
 ```
 
 Resolution runs through a sandbox worktree before touching your working tree. Safety checks:
@@ -116,7 +116,7 @@ git clone https://github.com/itstanner5216/Git-Print.git
 cd Git-Print
 pnpm install
 pnpm build
-npm link   # makes print-pr-review available system-wide
+npm link   # makes git-print available system-wide
 ```
 
 **Requirements:**
@@ -133,25 +133,25 @@ npm link   # makes print-pr-review available system-wide
 
 ```sh
 # Full output: review + report (+ conflicts file if applicable)
-print-pr-review 42
+git-print 42
 
 # Conversation and review threads only
-print-pr-review 42 --review-only
+git-print 42 --review-only
 
 # CI checks, annotations, changed files, commits only
-print-pr-review 42 --report-only
+git-print 42 --report-only
 
 # Resolve conflicts — accept incoming for all files (single-conflict shorthand)
-print-pr-review 42 --use-incoming
+git-print 42 --use-incoming
 
 # Resolve conflicts — mix strategies across files
-print-pr-review 42 --use-baseline config.ts --use-incoming utils.ts
+git-print 42 --use-baseline config.ts --use-incoming utils.ts
 
 # Run from outside the repo directory
-print-pr-review 42 --dir /path/to/my/repo
+git-print 42 --dir /path/to/my/repo
 
 # Inline token (overrides environment variables)
-print-pr-review 42 --token ghp_xxx
+git-print 42 --token ghp_xxx
 ```
 
 ### Output Location
@@ -172,7 +172,7 @@ Checks in order:
 stdout outputs file paths. stderr outputs progress and errors. This makes Git-Print composable in pipelines:
 
 ```sh
-FILES=$(print-pr-review 42) && cat $FILES
+FILES=$(git-print 42) && cat $FILES
 ```
 
 ---

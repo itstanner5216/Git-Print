@@ -13,8 +13,8 @@
  * current working tree (which must be on the PR head branch).
  */
 import { execSync } from "node:child_process";
-import { mkdir, unlink } from "node:fs/promises";
-import { existsSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdir, unlink, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync, writeFileSync, chmodSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { fetchAllPRData, fetchPRMetadata, fetchAllPages, renderPR, renderReport, renderConflicts, resolveConflicts, extractConflicts, gitCommonDir, } from "./pr-renderer.js";
 import { addRepo, addWorktree, remove as removeConfig, list as listConfig, resolve as resolveAlias, } from "./config.js";
@@ -164,7 +164,8 @@ AUTO CONFLICT DETECTION  (pre-push hook)
 OUTPUT FILES  (.git/Git-Print/ in the repo root)
   PR-<n>-review.md      Full PR conversation — comments, reviews, bots
   PR-<n>-report.md      CI checks, commits, files changed summary
-  PR-<n>-conflicts.md   Merge conflict regions with BASELINE / INCOMING blocks
+  PR-<n>-conflicts.md   Merge conflicts as line-numbered diffs — real editor
+                        line numbers, ours/theirs/ancestor, labeled markers
 
 EXAMPLES
   git-print add zenith-mcp /home/user/Projects/Zenith-MCP
@@ -315,6 +316,23 @@ function getGitHubRemote(gitRoot) {
     }
     return parsed;
 }
+/**
+ * Non-exiting variant of getGitHubRemote: returns null instead of calling
+ * process.exit when there's no `origin` remote or it isn't a GitHub URL.
+ * Used by `git-print auto`, which must degrade gracefully to a no-PR conflict
+ * report when run in an offline / non-GitHub repo.
+ */
+function tryGetGitHubRemote(gitRoot) {
+    try {
+        const remoteUrl = execSync("git remote get-url origin", {
+            cwd: gitRoot, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"],
+        }).trim();
+        return parseGitHubRemote(remoteUrl);
+    }
+    catch {
+        return null;
+    }
+}
 // ─── Subcommand handler ─────────────────────────────────────────────────────
 /**
  * Handle config subcommands (add / list / remove) and exit.
@@ -393,12 +411,7 @@ function detectLocalConflicts(dir) {
         return [];
     }
 }
-/**
- * Minimal conflict marker parser — parses `<<<<<<<` / `=======` / `>>>>>>>`
- * blocks from a file's content. Handles optional 3-way ancestor markers (`|||||||`).
- */
-function extractRegionsFromContent(content) {
-    const CONTEXT = 3;
+function parseConflictRegions(content) {
     const lines = content.split("\n");
     const regions = [];
     let i = 0;
@@ -407,162 +420,186 @@ function extractRegionsFromContent(content) {
             i++;
             continue;
         }
-        const startLine = i + 1; // 1-indexed
-        const baseLines = [];
-        const ancestorLines = [];
-        const incomingLines = [];
-        let hasAncestor = false;
-        let phase = "base";
-        let endLine = i;
-        i++;
-        while (i < lines.length) {
-            const line = lines[i];
-            if (line.startsWith("||||||| ")) {
-                hasAncestor = true;
-                phase = "ancestor";
-            }
-            else if (line === "=======") {
-                phase = "incoming";
-            }
-            else if (line.startsWith(">>>>>>> ")) {
-                endLine = i + 1; // 1-indexed
-                i++;
+        const start = i;
+        let ancStart = -1, sep = -1, end = -1, j = i + 1;
+        while (j < lines.length) {
+            const l = lines[j];
+            if (l.startsWith("||||||| ") && ancStart === -1 && sep === -1)
+                ancStart = j;
+            else if (l === "=======" && sep === -1)
+                sep = j;
+            else if (l.startsWith(">>>>>>> ")) {
+                end = j;
                 break;
             }
-            else {
-                if (phase === "base")
-                    baseLines.push(line);
-                else if (phase === "ancestor")
-                    ancestorLines.push(line);
-                else
-                    incomingLines.push(line);
-            }
-            i++;
+            j++;
         }
-        const ctxBeforeStart = Math.max(0, startLine - 1 - CONTEXT);
-        const ctxAfterEnd = Math.min(lines.length, endLine + CONTEXT);
+        if (sep === -1 || end === -1) {
+            i = start + 1;
+            continue;
+        } // malformed — skip
         regions.push({
-            startLine,
-            endLine,
-            baseContent: baseLines.join("\n"),
-            incomingContent: incomingLines.join("\n"),
-            ancestorContent: hasAncestor ? ancestorLines.join("\n") : undefined,
-            contextBefore: lines.slice(ctxBeforeStart, startLine - 1),
-            contextAfter: lines.slice(endLine, ctxAfterEnd),
+            start, ancStart, sep, end,
+            oursLabel: lines[start].slice(8).trim(),
+            theirsLabel: lines[end].slice(8).trim(),
         });
+        i = end + 1;
     }
     return regions;
 }
 /**
  * Render a local-conflict markdown report directly from working-tree files.
- * This is the local-state equivalent of renderConflicts() — fires when
- * git diff shows unmerged files regardless of GitHub's pr.mergeable value.
+ * Each conflict becomes a single line-numbered ```diff fence using the REAL
+ * editor line numbers (the ones you jump to to fix it), with ours = `-`,
+ * theirs = `+`, and the literal git markers turned into labeled full-width
+ * rules so they're impossible to miss. Local-state equivalent of
+ * renderConflicts() — fires whenever `git diff` shows unmerged files,
+ * regardless of GitHub's pr.mergeable value.
  */
 async function renderLocalConflicts(dir, conflictPaths, outputPath, prNumber, context) {
-    const { readFileSync, statSync } = await import("node:fs");
-    const { writeFile } = await import("node:fs/promises");
+    const CONTEXT = 3;
+    const RULE_WIDTH = 66;
+    const currentBranch = getCurrentBranch(dir);
     const files = [];
     for (const relPath of conflictPaths) {
         const fullPath = join(dir, relPath);
         try {
             const stat = statSync(fullPath);
             if (stat.size > 512_000) {
-                files.push({ path: relPath, regions: [], oversized: true });
+                files.push({ path: relPath, regions: [], lines: [], oversized: true, binary: false });
                 continue;
             }
             const content = readFileSync(fullPath, "utf-8");
-            files.push({ path: relPath, regions: extractRegionsFromContent(content), oversized: false });
+            if (content.includes("\u0000")) {
+                files.push({ path: relPath, regions: [], lines: [], oversized: false, binary: true });
+                continue;
+            }
+            files.push({
+                path: relPath,
+                regions: parseConflictRegions(content),
+                lines: content.split("\n"),
+                oversized: false, binary: false,
+            });
         }
         catch {
-            files.push({ path: relPath, regions: [], oversized: false });
+            files.push({ path: relPath, regions: [], lines: [], oversized: false, binary: false });
         }
     }
     const totalRegions = files.reduce((s, f) => s + f.regions.length, 0);
+    const firstRegion = files.find(f => f.regions.length > 0)?.regions[0];
+    const oursName = currentBranch ?? context.baseBranch;
+    const theirsName = (context.headBranch && context.headBranch !== "HEAD")
+        ? context.headBranch
+        : (firstRegion?.theirsLabel ?? context.headBranch);
     const out = [];
     const w = (line = "") => out.push(line);
-    w(`# ⚠ Merge Conflicts — PR #${prNumber}`);
+    // ── Header ──
+    w(`# ⚠ Merge Conflicts${prNumber > 0 ? ` — PR #${prNumber}` : ""}`);
     w();
-    w(`\`${context.headBranch}\` cannot merge cleanly into \`${context.baseBranch}\``);
+    w(`\`${theirsName}\` does not merge cleanly into \`${oursName}\``);
     w();
-    w(`${files.length} conflicting file${files.length !== 1 ? "s" : ""} · ${totalRegions} conflict region${totalRegions !== 1 ? "s" : ""}`);
+    w(`**${files.length}** conflicting file${files.length !== 1 ? "s" : ""} · **${totalRegions}** conflict region${totalRegions !== 1 ? "s" : ""}`);
     w();
-    w(`> **Source:** local working-tree conflict markers in \`${dir}\``);
+    w(`> **OURS** = your branch (\`${oursName}\`) · **THEIRS** = incoming (\`${theirsName}\`) · **BASE** = common ancestor _(shown only with diff3 / zdiff3 conflict style)_`);
+    w(`>`);
+    w(`> Gutter numbers are the real file line numbers. \`-\` is ours, \`+\` is theirs.`);
     w();
     w("---");
-    const langMap = {
-        ts: "typescript", js: "javascript", py: "python", rs: "rust",
-        go: "go", java: "java", kt: "kotlin", swift: "swift",
-        cpp: "cpp", c: "c", cs: "csharp", rb: "ruby",
-        md: "markdown", json: "json", yaml: "yaml", toml: "toml",
-        sh: "bash", bash: "bash", zsh: "bash",
+    const rule = (prefix, ch) => {
+        const pad = Math.max(3, RULE_WIDTH - prefix.length);
+        return `${prefix} ${ch.repeat(pad)}`;
     };
-    const langFor = (p) => langMap[p.split(".").pop() ?? ""] ?? "";
     for (const file of files) {
-        const regionCount = file.oversized ? "⚠ oversized" : `${file.regions.length} conflict${file.regions.length !== 1 ? "s" : ""}`;
         w();
-        w(`## 📁 ${file.path}  ·  ${regionCount}`);
+        const badge = file.oversized ? "⚠ oversized"
+            : file.binary ? "binary"
+                : `${file.regions.length} conflict${file.regions.length !== 1 ? "s" : ""}`;
+        w(`## 📁 \`${file.path}\`  ·  ${badge}`);
         w();
         if (file.oversized) {
-            w("> File exceeds 500KB — content not shown.");
-            w();
+            w("> File exceeds 500 KB — content not shown.");
+            continue;
+        }
+        if (file.binary) {
+            w("> Binary file — no inline diff.");
             continue;
         }
         if (file.regions.length === 0) {
-            w("> Binary or deleted-vs-modified conflict — no inline markers.");
-            w();
+            w("> No inline conflict markers (delete/modify or rename conflict).");
             continue;
         }
-        const lang = langFor(file.path);
         for (let r = 0; r < file.regions.length; r++) {
-            const region = file.regions[r];
-            w(`### Conflict ${r + 1} of ${file.regions.length} — Lines ${region.startLine}–${region.endLine}`);
-            w();
-            // Classify
-            const baseEmpty = region.baseContent.trim() === "";
-            const incomingEmpty = region.incomingContent.trim() === "";
-            if (baseEmpty && !incomingEmpty)
-                w("> 🟢 Addition — incoming adds new content, baseline has nothing here.");
-            else if (!baseEmpty && incomingEmpty)
-                w("> 🔴 Deletion — incoming removes content present in baseline.");
-            else if (region.ancestorContent !== undefined)
-                w("> ⚡ Both modified — baseline and incoming both changed from the common ancestor.");
+            const rg = file.regions[r];
+            const oursCount = (rg.ancStart !== -1 ? rg.ancStart : rg.sep) - rg.start - 1;
+            const theirsCount = rg.end - rg.sep - 1;
+            let cls;
+            if (oursCount === 0)
+                cls = `🟢 Incoming adds ${theirsCount} line${theirsCount !== 1 ? "s" : ""}; ours is empty here.`;
+            else if (theirsCount === 0)
+                cls = `🔴 Incoming deletes ${oursCount} line${oursCount !== 1 ? "s" : ""} that ours keeps.`;
             else
-                w("> ✏️ Both modified — baseline and incoming differ.");
+                cls = `⚡ Both sides edited this span${rg.ancStart !== -1 ? " (ancestor shown)" : ""}.`;
+            w(`### Conflict ${r + 1} of ${file.regions.length} · lines ${rg.start + 1}–${rg.end + 1}`);
             w();
-            if (region.contextBefore.length > 0) {
-                w("Context:");
-                w("```");
-                for (const cl of region.contextBefore)
-                    w(cl);
-                w("```");
-                w();
-            }
-            w(`**⬅ BASELINE** (\`${context.baseBranch}\`):`);
-            w("```" + lang);
-            w(region.baseContent);
-            w("```");
+            w(`> ${cls}`);
             w();
-            if (region.ancestorContent !== undefined) {
-                w(`**ANCESTOR** (common):`);
-                w("```" + lang);
-                w(region.ancestorContent);
-                w("```");
-                w();
+            const ctxStart = Math.max(0, rg.start - CONTEXT);
+            const ctxEnd = Math.min(file.lines.length - 1, rg.end + CONTEXT);
+            const width = String(ctxEnd + 1).length;
+            const g = (n) => String(n).padStart(width);
+            const oursLabel = (rg.oursLabel === "HEAD" && currentBranch) ? currentBranch : rg.oursLabel;
+            const oursBoundary = rg.ancStart !== -1 ? rg.ancStart : rg.sep;
+            w("```diff");
+            for (let k = ctxStart; k <= ctxEnd; k++) {
+                const ln = k + 1;
+                const text = file.lines[k];
+                if (k === rg.start) {
+                    out.push(`${g(ln)}  ${rule(`<<<<<<< OURS · ${oursLabel}`, "═")}`);
+                }
+                else if (k === rg.ancStart) {
+                    out.push(`${g(ln)}  ${rule("||||||| BASE · common ancestor", "─")}`);
+                }
+                else if (k === rg.sep) {
+                    out.push(`${g(ln)}  ${rule(`======= THEIRS · ${rg.theirsLabel}`, "═")}`);
+                }
+                else if (k === rg.end) {
+                    out.push(`${g(ln)}  ${rule(">>>>>>> END", "═")}`);
+                }
+                else {
+                    let m = " ";
+                    if (k > rg.start && k < oursBoundary)
+                        m = "-"; // ours
+                    else if (k > rg.sep && k < rg.end)
+                        m = "+"; // theirs
+                    out.push(`${g(ln)} ${m} ${text}`.replace(/\s+$/, ""));
+                }
             }
-            w(`**➡ INCOMING** (\`${context.headBranch}\`):`);
-            w("```" + lang);
-            w(region.incomingContent);
             w("```");
-            if (region.contextAfter.length > 0) {
-                w();
-                w("```");
-                for (const cl of region.contextAfter)
-                    w(cl);
-                w("```");
-            }
             w();
         }
     }
+    // ── Summary ──
+    w("---");
+    w();
+    w("## Summary");
+    w();
+    w("| File | Conflicts | Lines |");
+    w("|------|-----------|-------|");
+    for (const file of files) {
+        if (file.oversized)
+            w(`| \`${file.path}\` | ⚠ oversized | — |`);
+        else if (file.binary)
+            w(`| \`${file.path}\` | binary | — |`);
+        else if (file.regions.length === 0)
+            w(`| \`${file.path}\` | delete/modify | — |`);
+        else {
+            const spans = file.regions.map(rr => `L${rr.start + 1}–${rr.end + 1}`).join(", ");
+            w(`| \`${file.path}\` | ${file.regions.length} | ${spans} |`);
+        }
+    }
+    w();
+    w(`**Total:** ${files.length} file${files.length !== 1 ? "s" : ""} · ${totalRegions} conflict region${totalRegions !== 1 ? "s" : ""}`);
+    w();
     await writeFile(outputPath, out.join("\n"), "utf-8");
     return outputPath;
 }
@@ -791,10 +828,7 @@ async function runAuto() {
     const branch = getCurrentBranch(gitRoot);
     const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_PAT || null;
     let remote = null;
-    try {
-        remote = getGitHubRemote(gitRoot);
-    }
-    catch { /* no GitHub remote */ }
+    remote = tryGetGitHubRemote(gitRoot);
     const outputDir = getOutputDir(gitRoot);
     await mkdir(outputDir, { recursive: true });
     let prNumber = null;

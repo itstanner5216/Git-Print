@@ -36,7 +36,7 @@ That's the entire workflow. Run it from anywhere inside your repository. Git-Pri
 |------|-----------------|
 | `PR-42-review.md` | Every comment, inline thread, review, and suggested change — numbered in exact scroll order, with diff context, reviewer identity, timestamps, and resolution state |
 | `PR-42-report.md` | CI check results with failure annotations and source-level markers, changed files list sorted by status, full commit history |
-| `PR-42-conflicts.md` | *(only when conflicts exist)* Every conflict region with surrounding context, both sides shown side-by-side, classified by type, with exact resolve commands |
+| `PR-42-conflicts.md` | *(only when conflicts exist)* Every conflict as a line-numbered `diff` block — real editor line numbers, ours/theirs/ancestor, labeled markers, classified by type, with a summary table and exact resolve commands |
 
 ---
 
@@ -84,9 +84,33 @@ The `PR-{n}-review.md` file isn't an API dump. It's a faithful reconstruction of
 
 ## The Merge Conflict Workflow
 
-When a PR has conflicts, Git-Print runs a trial merge in an isolated Git worktree, extracts every conflict region with surrounding context, and writes `PR-{n}-conflicts.md`. The file classifies each conflict by type (both-modified, delete/modify, binary, submodule) and includes the exact resolve commands.
+Git-Print writes `PR-{n}-conflicts.md` whenever a merge can't apply cleanly. It detects conflicts two ways:
 
-**Resolving conflicts is a single additional flag:**
+- **Local working tree** — if you're mid-merge in a (work)tree with unresolved markers (`git diff --diff-filter=U`), it renders them directly. This fires from any conflicted worktree, regardless of what GitHub's `mergeable` flag says.
+- **Trial merge** — if the PR is clean locally but GitHub reports it dirty, it runs a trial merge in an isolated worktree to surface the conflicts.
+
+### What the conflict file looks like
+
+Each conflict is one **line-numbered `diff` block** using the *real editor line numbers* — the exact line you jump to to fix it. `-` is ours, `+` is theirs, the common ancestor is shown as context (with diff3/zdiff3), and every git marker is turned into a labeled, full-width rule so it's impossible to miss:
+
+```diff
+ 6   import { getLangForFile, isSupported } from './tree-sitter.js';
+ 7  <<<<<<< OURS · main ════════════════════════════════════════════════════
+ 8  ||||||| BASE · common ancestor ────────────────────────────────────────
+ 9   import { getSymbols, getLangForFile, isSupported } from './tree-sitter.js';
+10  ======= THEIRS · feature/login ════════════════════════════════════
+11 + import { getSymbols } from './tree-sitter/symbols.js';
+12  >>>>>>> END ═══════════════════════════════════════════════════════
+13   import { getDefaultExcludes } from './shared.js';
+```
+
+Each file gets a `## 📁` header, each region a classification line (🟢 addition / 🔴 deletion / ⚡ both edited), and the file ends with a summary table of every conflict span. No external dependency — the gutter and markers are rendered by Git-Print itself.
+
+> **Optional:** if you like a terminal view, [`git-split-diffs`](https://github.com/banga/git-split-diffs) renders the same data with color — `git diff --diff-filter=U | git-split-diffs`. Git-Print does **not** require it; the Markdown above is self-contained.
+
+### Resolving conflicts
+
+**Resolving is a single additional flag:**
 
 ```sh
 # Accept the base branch version of one file, the incoming version of another

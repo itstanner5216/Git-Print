@@ -14,11 +14,11 @@
  */
 
 import { execSync } from "node:child_process";
-import { mkdir, unlink } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { mkdir, unlink, writeFile, readFile, chmod } from "node:fs/promises";
+import { existsSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import {
-  fetchAllPRData, fetchPRMetadata, renderPR, renderReport, renderConflicts,
+  fetchAllPRData, fetchPRMetadata, fetchAllPages, renderPR, renderReport, renderConflicts,
   resolveConflicts, extractConflicts, gitCommonDir,
 } from "./pr-renderer.js";
 import type { PRRendererOptions, PRData, PRMetadata } from "./pr-renderer.js";
@@ -178,6 +178,48 @@ function getGitRoot(fromDir: string): string {
   } catch {
     console.error(`Error: Not a git repository (or any parent up to mount point): ${fromDir}`);
     process.exit(1);
+  }
+}
+
+function getCurrentBranch(fromDir: string): string | null {
+  try {
+    return execSync("git branch --show-current", {
+      cwd: fromDir,
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function getGitVersion(): { major: number; minor: number } {
+  try {
+    const raw = execSync("git --version", { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+    // "git version 2.54.1" → [2, 54]
+    const m = raw.match(/(\d+)\.(\d+)/);
+    if (!m) return { major: 0, minor: 0 };
+    return { major: parseInt(m[1], 10), minor: parseInt(m[2], 10) };
+  } catch {
+    return { major: 0, minor: 0 };
+  }
+}
+
+/**
+ * Find the open PR number for the current branch using the same
+ * fetchAllPages pattern used throughout git-print.
+ */
+async function findPRForBranch(
+  owner: string, repo: string, branch: string, token: string,
+): Promise<number | null> {
+  try {
+    const prs = await fetchAllPages<{ number: number }>(
+      `/repos/${owner}/${repo}/pulls?head=${owner}:${encodeURIComponent(branch)}&state=open&per_page=1`,
+      token,
+    );
+    return prs.length > 0 ? prs[0].number : null;
+  } catch {
+    return null;
   }
 }
 
@@ -741,15 +783,139 @@ const isEntry = (() => {
 
 if (isEntry) {
   const args = process.argv.slice(2);
-  const sub = args[0];
+  const sub  = args[0];
 
-  // Route config subcommands before anything else — they don’t need a PR number or token
   if (sub === "add" || sub === "list" || sub === "remove") {
     runSubcommand(args);
+  } else if (sub === "auto") {
+    runAuto().catch((e) => {
+      console.error(`git-print auto: ${e.message}`);
+      process.exit(0);
+    });
+  } else if (sub === "install") {
+    runInstall();
+  } else if (sub === "uninstall") {
+    runUninstall();
   } else {
     main().catch((e) => {
       console.error(`Fatal: ${e.message}`);
       process.exit(1);
     });
+  }
+}
+
+// ─── Auto subcommand ──────────────────────────────────────────────────────────
+
+async function runAuto(): Promise<void> {
+  const dir = process.cwd();
+  const conflictFiles = detectLocalConflicts(dir);
+  if (conflictFiles.length === 0) process.exit(0);
+
+  console.error(`\n⚠  git-print: ${conflictFiles.length} unresolved conflict${conflictFiles.length !== 1 ? "s" : ""} detected`);
+  for (const f of conflictFiles) console.error(`   • ${f}`);
+
+  const gitRoot = getGitRoot(dir);
+  const branch  = getCurrentBranch(gitRoot);
+  const token   = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_PAT || null;
+
+  let remote: { owner: string; repo: string } | null = null;
+  try { remote = getGitHubRemote(gitRoot); } catch { /* no GitHub remote */ }
+
+  const commonDir = gitCommonDir(gitRoot);
+  const outputDir = join(commonDir, "Git-Print");
+  await mkdir(outputDir, { recursive: true });
+
+  let prNumber: number | null = null;
+  if (remote && branch && token) {
+    prNumber = await findPRForBranch(remote.owner, remote.repo, branch, token);
+  }
+
+  if (prNumber && remote && token) {
+    console.error(`   PR #${prNumber} found — generating full report...`);
+    const data = await fetchAllPRData(remote.owner, remote.repo, prNumber, token, token);
+    const base: PRRendererOptions = {
+      owner: remote.owner, repo: remote.repo,
+      pullNumber: prNumber, token, outputPath: "",
+      graphqlToken: token, includeResolvedThreads: true, fetchCheckAnnotations: true,
+    };
+    const reviewPath   = join(outputDir, `PR-${prNumber}-review.md`);
+    const reportPath   = join(outputDir, `PR-${prNumber}-report.md`);
+    const conflictPath = join(outputDir, `PR-${prNumber}-conflicts.md`);
+
+    await renderPR(data, { ...base, outputPath: reviewPath });
+    await renderReport(data, { ...base, outputPath: reportPath });
+    await renderLocalConflicts(dir, conflictFiles, conflictPath, prNumber,
+      { baseBranch: data.pr.base.ref, headBranch: data.pr.head.ref });
+
+    console.error(`\n✓  ${outputDir}`);
+    console.error(`   • PR-${prNumber}-review.md`);
+    console.error(`   • PR-${prNumber}-report.md`);
+    console.error(`   • PR-${prNumber}-conflicts.md`);
+  } else {
+    const safeBranch   = branch ? branch.replace(/\//g, "-") : null;
+    const label        = safeBranch ? `branch-${safeBranch}` : `conflict`;
+    const conflictPath = join(outputDir, `${label}-conflicts.md`);
+    await renderLocalConflicts(dir, conflictFiles, conflictPath, 0,
+      { baseBranch: branch ?? "base", headBranch: "HEAD" });
+    console.error(`\n✓  ${conflictPath}`);
+    if (!token) console.error(`   Tip: set GITHUB_TOKEN to auto-link to a PR`);
+  }
+}
+
+// ─── Install / Uninstall ──────────────────────────────────────────────────────
+
+const HOOK_NAME = "git-print-conflicts";
+
+function runInstall(): void {
+  const { major, minor } = getGitVersion();
+  const hasConfigHooks = major > 2 || (major === 2 && minor >= 54);
+
+  if (hasConfigHooks) {
+    execSync(`git config --global hook.${HOOK_NAME}.event pre-push`, { stdio: "inherit" });
+    execSync(`git config --global "hook.${HOOK_NAME}.command" "git-print auto"`, { stdio: "inherit" });
+    console.log(`✓  Installed (git ${major}.${minor} — config-based hook, global, no files written)`);
+    console.log(`   Runs git-print auto on every push across all repos.`);
+    console.log(`   Uninstall: git-print uninstall`);
+  } else {
+    const gitRoot  = getGitRoot(process.cwd());
+    const hookPath = join(gitRoot, ".git", "hooks", "pre-push");
+    // readFileSync, writeFileSync, chmodSync imported at top
+    const marker   = "# git-print auto";
+
+    if (existsSync(hookPath)) {
+      const src = readFileSync(hookPath, "utf-8") as string;
+      if (src.includes(marker)) { console.log(`✓  Already installed in ${hookPath}`); return; }
+      writeFileSync(hookPath, `${src.trimEnd()}\n\n${marker}\ngit ls-files -u | grep -q . && git-print auto\n`);
+      console.log(`✓  Appended to existing pre-push hook: ${hookPath}`);
+    } else {
+      writeFileSync(hookPath, `#!/bin/bash\n${marker}\ngit ls-files -u | grep -q . && git-print auto\nexit 0\n`);
+      chmodSync(hookPath, 0o755);
+      console.log(`✓  Created pre-push hook: ${hookPath}`);
+    }
+    console.log(`   (git 2.54+ supports a cleaner global config-based hook)`);
+    console.log(`   Uninstall: git-print uninstall`);
+  }
+}
+
+function runUninstall(): void {
+  const { major, minor } = getGitVersion();
+  const hasConfigHooks = major > 2 || (major === 2 && minor >= 54);
+
+  if (hasConfigHooks) {
+    try {
+      execSync(`git config --global --remove-section hook.${HOOK_NAME}`, { stdio: "pipe" });
+      console.log(`✓  Removed hook from ~/.gitconfig`);
+    } catch { console.log(`Nothing to remove — hook not found in ~/.gitconfig`); }
+  } else {
+    const gitRoot  = getGitRoot(process.cwd());
+    const hookPath = join(gitRoot, ".git", "hooks", "pre-push");
+    if (!existsSync(hookPath)) { console.log(`Nothing to remove — no pre-push hook found`); return; }
+    // readFileSync, writeFileSync imported at top
+    const filtered = (readFileSync(hookPath, "utf-8") as string)
+      .split("\n")
+      .filter((l: string) => !l.includes("git-print auto") && !l.includes("# git-print auto"))
+      .join("\n");
+    writeFileSync(hookPath, filtered);
+    console.log(`✓  Removed git-print lines from ${hookPath}`);
   }
 }

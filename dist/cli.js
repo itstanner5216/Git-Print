@@ -105,36 +105,73 @@ function parseArgs() {
     return { prNumber, token, dir, repo, worktree, reviewOnly, reportOnly, resolutions, bareBaseline, bareIncoming };
 }
 function printUsage() {
-    console.error(`
-Usage: git-print <pr-number> [options]
-       git-print add <alias> [path]
-       git-print add <alias>/<worktree> [path]
-       git-print list
-       git-print remove <alias|alias/worktree>
+    console.log(`
+git-print — GitHub PR review printer & conflict reporter
 
-Options:
-  --token <token>          GitHub personal access token (default: $GITHUB_TOKEN or $GH_TOKEN)
-  --dir <path>             Directory to detect git repo from (default: cwd)
-  --repo <alias>           Use a registered repo alias instead of --dir
-  --worktree <name>        Use a named worktree within --repo
-  --review-only            Only generate the conversation review file
-  --report-only            Only generate the CI/commits/files report
-  --use-baseline <file>    Resolve conflicts in <file> using the base branch version (repeatable)
-  --use-incoming <file>    Resolve conflicts in <file> using the PR branch version (repeatable)
-  -h, --help               Show this help message
+USAGE
+  git-print <pr-number> [options]       Generate PR review + report files
+  git-print <command> [args]            Run a subcommand
 
-Repo aliases:
-  git-print add zenith-mcp /path/to/repo   Register a repo alias
-  git-print add zenith-mcp                  Auto-detect path from cwd
-  git-print add zenith-mcp/pr23-test /wt    Register a worktree
-  git-print list                            Show all registered repos
-  git-print remove zenith-mcp              Remove repo + its worktrees
+PR GENERATION
+  git-print 24                          Print PR #24 from the current repo
+  git-print 24 --repo zenith-mcp        Print from a registered repo alias
+  git-print 24 --repo zenith-mcp --worktree pr23-test
+                                        Print from a specific worktree
+  git-print 24 --review-only            Only generate the conversation review
+  git-print 24 --report-only            Only generate the CI/commits/files report
 
-Conflict resolution:
-  When --use-baseline or --use-incoming flags are present, the tool runs the
-  merge in a sandbox worktree to verify the resolution is safe, then applies
-  it to your current working tree. You must be on the PR head branch.
-  If only one file conflicts, the filename can be omitted.
+OPTIONS
+  --token <token>       GitHub personal access token
+                        (default: \$GITHUB_TOKEN, \$GH_TOKEN, or \$GITHUB_PAT)
+  --dir <path>          Directory to detect git repo from (default: cwd)
+  --repo <alias>        Use a registered repo alias instead of --dir
+  --worktree <name>     Use a named worktree within --repo
+  --review-only         Only write the PR conversation review file
+  --report-only         Only write the CI / commits / files report
+  --use-baseline <file> Resolve conflict in <file> using the base branch version
+  --use-incoming <file> Resolve conflict in <file> using the PR branch version
+  -h, --help            Show this help
+
+CONFLICT RESOLUTION
+  git-print 24 --use-incoming src/foo.ts
+                        Accept the incoming (PR) version of foo.ts
+  git-print 24 --use-baseline src/foo.ts
+                        Accept the baseline (base branch) version of foo.ts
+  git-print 24 --use-incoming          (auto-selects the single conflicting file)
+
+  Runs a sandbox trial merge to validate the resolution before applying
+  it to your working tree. Must be on the PR head branch.
+
+REPO ALIASES  (config: ~/.config/git-print/config)
+  git-print add <alias> [path]          Register a repo alias
+                                        Omit path to auto-detect from cwd
+  git-print add <alias>/<name> [path]   Register a named worktree
+                                        Omit path to use cwd
+  git-print list                        List all registered repos + worktrees
+                                        (auto-discovered worktrees shown too)
+  git-print remove <alias>              Remove a repo and all its worktrees
+  git-print remove <alias>/<name>       Remove a single worktree entry
+
+AUTO CONFLICT DETECTION  (pre-push hook)
+  git-print install     Install the pre-push hook
+                        git >= 2.54: config-based hook in ~/.gitconfig (global)
+                        git <  2.54: shell script in .git/hooks/pre-push
+  git-print uninstall   Remove the hook
+  git-print auto        Run manually: detect local conflicts, find the open
+                        PR for the current branch, generate/overwrite files
+                        Exits silently if no conflicts found
+
+OUTPUT FILES  (.git/Git-Print/ in the repo root)
+  PR-<n>-review.md      Full PR conversation — comments, reviews, bots
+  PR-<n>-report.md      CI checks, commits, files changed summary
+  PR-<n>-conflicts.md   Merge conflict regions with BASELINE / INCOMING blocks
+
+EXAMPLES
+  git-print add zenith-mcp /home/user/Projects/Zenith-MCP
+  git-print add zenith-mcp/pr23-test /home/user/Worktrees/pr23-test
+  git-print 24 --repo zenith-mcp
+  git-print 24 --repo zenith-mcp --worktree pr23-test
+  git-print install && git push origin my-branch
 `.trim());
 }
 // ─── Git helpers ─────────────────────────────────────────────────────────────

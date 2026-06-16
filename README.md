@@ -87,7 +87,7 @@ The `PR-{n}-review.md` file isn't an API dump. It's a faithful reconstruction of
 Git-Print writes `PR-{n}-conflicts.md` whenever a merge can't apply cleanly. It detects conflicts two ways:
 
 - **Local working tree** — if you're mid-merge in a (work)tree with unresolved markers (`git diff --diff-filter=U`), it renders them directly. This fires from any conflicted worktree, regardless of what GitHub's `mergeable` flag says.
-- **Trial merge** — if the PR is clean locally but GitHub reports it dirty, it runs a trial merge in an isolated worktree to surface the conflicts.
+- **Trial merge** — if the PR is clean locally but GitHub reports it dirty, it runs an in-memory trial merge (`git merge-tree --write-tree`) to surface the conflicts. No worktree, no checkout, nothing written to your working tree.
 
 ### What the conflict file looks like
 

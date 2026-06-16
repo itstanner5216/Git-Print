@@ -9,7 +9,6 @@
  * All shared API data is fetched once via fetchAllPRData() and passed to both renderers.
  */
 import { writeFile, unlink } from "node:fs/promises";
-import { readFileSync, statSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { join, basename, extname } from "node:path";
@@ -1673,59 +1672,89 @@ function getStagedFingerprint(workTree, path) {
 }
 // ─── extractConflicts — trial merge in temp worktree ─────────────────────────
 /**
- * Detect conflict regions for the PR by performing a trial merge in an
- * isolated worktree. The worktree is checked out at the base SHA and the
- * head SHA is merged into it, so the resulting markers are in the natural
- * direction for review reporting (ours = base, theirs = head).
+ * Detect conflict regions for the PR via an in-memory trial merge.
  *
- * Note: this differs from the RESOLUTION path, which checks out the head SHA
- * and merges base into it so commits live on the PR's head branch.
+ * Uses `git merge-tree --write-tree` (git ≥2.38): a real merge performed
+ * entirely in the object database — no worktree, no checkout, nothing written
+ * to the working tree, nothing to clean up. The merge is run base-first
+ * (`merge-tree base head`) so the resulting markers read ours = base,
+ * theirs = head — the natural direction for review reporting. The merged
+ * blobs (read back with `git show <tree>:<path>`) carry the conflict markers,
+ * honoring the user's merge.conflictStyle (incl. zdiff3), and feed the same
+ * parseConflictMarkers() used everywhere else.
+ *
+ * Note: this differs from the RESOLUTION path, which must use a real worktree
+ * because it writes commits onto the PR's head branch.
  */
 export function extractConflicts(gitRoot, base, head, prSpec = { pullNumber: 0 }) {
-    const worktreeDir = allocWorktreeDir(gitRoot, "extract");
-    // Prune stale worktree lockfiles from killed processes
-    gitExecSafe(["worktree", "prune"], gitRoot);
+    const refs = fetchPrRefs(gitRoot, base, head, prSpec);
+    // In-memory trial merge. exit 0 = clean, 1 = conflicts, >1 = merge error.
+    let status, stdout, stderr;
     try {
-        const refs = fetchPrRefs(gitRoot, base, head, prSpec);
-        // Worktree at base SHA so markers read base=ours, head=theirs.
-        gitExec(["worktree", "add", "--detach", worktreeDir, refs.baseSha], gitRoot);
-        // Attempt merge of the head SHA.
-        const mergeResult = gitExecSafe(["merge", "--no-commit", "--no-ff", refs.headSha], worktreeDir);
-        if (mergeResult.ok) {
-            return []; // No conflicts
-        }
-        // Get conflicting file paths
-        const conflictOutput = gitExecSafe(["diff", "--name-only", "--diff-filter=U"], worktreeDir);
-        if (!conflictOutput.ok || !conflictOutput.stdout) {
-            // Merge failed for non-conflict reasons
-            console.error(`Warning: Merge failed but no unmerged files found. Git stderr: ${mergeResult.stderr}`);
-            return [];
-        }
-        const conflictPaths = conflictOutput.stdout.split("\n").filter(Boolean);
-        const results = [];
-        for (const filePath of conflictPaths) {
-            const fullPath = join(worktreeDir, filePath);
-            try {
-                const stat = statSync(fullPath);
-                if (stat.size > 512_000) {
-                    results.push({ path: filePath, regions: [], oversized: true });
-                    continue;
-                }
-            }
-            catch {
-                // File might be deleted in one side — binary conflict
-                results.push({ path: filePath, regions: [], oversized: false });
-                continue;
-            }
-            const content = readFileSync(fullPath, "utf-8");
-            const regions = parseConflictMarkers(content);
-            results.push({ path: filePath, regions, oversized: false });
-        }
-        return results;
+        stdout = execFileSync("git", ["merge-tree", "--write-tree", "--name-only", refs.baseRef, refs.headRef], {
+            cwd: gitRoot, encoding: "utf-8", timeout: GIT_LOCAL_TIMEOUT,
+            stdio: ["pipe", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024,
+        }).toString();
+        status = 0;
+        stderr = "";
     }
-    finally {
-        cleanupWorktree(gitRoot, worktreeDir);
+    catch (e) {
+        status = typeof e.status === "number" ? e.status : -1;
+        stdout = e.stdout?.toString() ?? "";
+        stderr = e.stderr?.toString() ?? "";
     }
+    if (status === 0)
+        return []; // clean merge
+    if (status !== 1) { // genuine merge-tree failure
+        throw new Error(`git merge-tree failed (exit ${status}): ${stderr || stdout.slice(0, 200)}`);
+    }
+    // Output shape (non -z, --name-only):
+    //   <tree-oid>
+    //   <conflicted path>            (zero or more)
+    //   <blank line>
+    //   <informational messages...>  (ignored)
+    const lines = stdout.split("\n");
+    const tree = (lines[0] ?? "").trim();
+    if (!/^[0-9a-f]{7,64}$/.test(tree)) {
+        throw new Error(`git merge-tree produced no tree OID: ${stderr || stdout.slice(0, 200)}`);
+    }
+    let blankIdx = lines.indexOf("", 1);
+    if (blankIdx === -1)
+        blankIdx = lines.length;
+    const conflictPaths = lines.slice(1, blankIdx).map(s => s.trim()).filter(Boolean);
+    const results = [];
+    for (const filePath of conflictPaths) {
+        // Size gate straight from the object DB — no disk read.
+        const sz = gitExecSafe(["cat-file", "-s", `${tree}:${filePath}`], gitRoot);
+        if (!sz.ok) {
+            // Path isn't a blob in the merged tree — binary / modify-delete / rename.
+            results.push({ path: filePath, regions: [], oversized: false });
+            continue;
+        }
+        if (Number(sz.stdout) > 512_000) {
+            results.push({ path: filePath, regions: [], oversized: true });
+            continue;
+        }
+        // Read the merged blob WITHOUT trimming so conflict line numbers stay exact.
+        let content;
+        try {
+            content = execFileSync("git", ["show", `${tree}:${filePath}`], {
+                cwd: gitRoot, encoding: "utf-8", timeout: GIT_LOCAL_TIMEOUT,
+                stdio: ["pipe", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024,
+            }).toString();
+        }
+        catch {
+            results.push({ path: filePath, regions: [], oversized: false });
+            continue;
+        }
+        if (content.includes("\u0000")) { // binary blob
+            results.push({ path: filePath, regions: [], oversized: false });
+            continue;
+        }
+        const regions = parseConflictMarkers(content);
+        results.push({ path: filePath, regions, oversized: false });
+    }
+    return results;
 }
 // ─── renderConflicts — markdown conflict report ──────────────────────────────
 export async function renderConflicts(data, options) {

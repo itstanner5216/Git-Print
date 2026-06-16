@@ -226,13 +226,19 @@ interface PrRefSpec {
     pullNumber: number;
 }
 /**
- * Detect conflict regions for the PR by performing a trial merge in an
- * isolated worktree. The worktree is checked out at the base SHA and the
- * head SHA is merged into it, so the resulting markers are in the natural
- * direction for review reporting (ours = base, theirs = head).
+ * Detect conflict regions for the PR via an in-memory trial merge.
  *
- * Note: this differs from the RESOLUTION path, which checks out the head SHA
- * and merges base into it so commits live on the PR's head branch.
+ * Uses `git merge-tree --write-tree` (git ≥2.38): a real merge performed
+ * entirely in the object database — no worktree, no checkout, nothing written
+ * to the working tree, nothing to clean up. The merge is run base-first
+ * (`merge-tree base head`) so the resulting markers read ours = base,
+ * theirs = head — the natural direction for review reporting. The merged
+ * blobs (read back with `git show <tree>:<path>`) carry the conflict markers,
+ * honoring the user's merge.conflictStyle (incl. zdiff3), and feed the same
+ * parseConflictMarkers() used everywhere else.
+ *
+ * Note: this differs from the RESOLUTION path, which must use a real worktree
+ * because it writes commits onto the PR's head branch.
  */
 export declare function extractConflicts(gitRoot: string, base: string, head: string, prSpec?: PrRefSpec): ConflictFile[];
 export declare function renderConflicts(data: PRData, options: PRRendererOptions & {

@@ -16,7 +16,7 @@ import { execSync } from "node:child_process";
 import { mkdir, unlink, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync, writeFileSync, chmodSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { fetchAllPRData, fetchPRMetadata, fetchAllPages, renderPR, renderReport, renderConflicts, resolveConflicts, extractConflicts, gitCommonDir, } from "./pr-renderer.js";
+import { fetchAllPRData, fetchPRMetadata, fetchAllPages, renderPR, renderReport, resolveConflicts, extractConflicts, gitCommonDir, } from "./pr-renderer.js";
 import { addRepo, addWorktree, remove as removeConfig, list as listConfig, resolve as resolveAlias, } from "./config.js";
 function parseArgs() {
     const args = process.argv.slice(2);
@@ -447,52 +447,104 @@ function parseConflictRegions(content) {
     }
     return regions;
 }
+const CONFLICT_CONTEXT = 3;
 /**
- * Render a local-conflict markdown report directly from working-tree files.
- * Each conflict becomes a single line-numbered ```diff fence using the REAL
- * editor line numbers (the ones you jump to to fix it), with ours = `-`,
- * theirs = `+`, and the literal git markers turned into labeled full-width
- * rules so they're impossible to miss. Local-state equivalent of
- * renderConflicts() — fires whenever `git diff` shows unmerged files,
- * regardless of GitHub's pr.mergeable value.
+ * Normalizer A — build the unified model from the live working tree. Reads
+ * each conflicted file and parses its real markers, so gutter line numbers
+ * are the exact editor lines.
  */
-async function renderLocalConflicts(dir, conflictPaths, outputPath, prNumber, context) {
-    const CONTEXT = 3;
-    const RULE_WIDTH = 66;
-    const currentBranch = getCurrentBranch(dir);
+function conflictFilesFromWorkingTree(dir, conflictPaths) {
     const files = [];
     for (const relPath of conflictPaths) {
         const fullPath = join(dir, relPath);
         try {
             const stat = statSync(fullPath);
             if (stat.size > 512_000) {
-                files.push({ path: relPath, regions: [], lines: [], oversized: true, binary: false });
+                files.push({ path: relPath, notice: "oversized", regions: [] });
                 continue;
             }
             const content = readFileSync(fullPath, "utf-8");
             if (content.includes("\u0000")) {
-                files.push({ path: relPath, regions: [], lines: [], oversized: false, binary: true });
+                files.push({ path: relPath, notice: "nomarkers", regions: [] });
                 continue;
             }
-            files.push({
-                path: relPath,
-                regions: parseConflictRegions(content),
-                lines: content.split("\n"),
-                oversized: false, binary: false,
+            const lines = content.split("\n");
+            const raw = parseConflictRegions(content);
+            if (raw.length === 0) {
+                files.push({ path: relPath, notice: "nomarkers", regions: [] });
+                continue;
+            }
+            const regions = raw.map((rg, idx) => {
+                const oursBoundary = rg.ancStart !== -1 ? rg.ancStart : rg.sep;
+                // Clamp context so neighboring regions never bleed markers into each other.
+                const prevEnd = idx > 0 ? raw[idx - 1].end : -1;
+                const nextStart = idx < raw.length - 1 ? raw[idx + 1].start : lines.length;
+                const ctxStart = Math.max(0, rg.start - CONFLICT_CONTEXT, prevEnd + 1);
+                const ctxEnd = Math.min(lines.length, rg.end + 1 + CONFLICT_CONTEXT, nextStart);
+                return {
+                    startLine: rg.start + 1,
+                    endLine: rg.end + 1,
+                    oursLines: lines.slice(rg.start + 1, oursBoundary),
+                    ancestorLines: rg.ancStart !== -1 ? lines.slice(rg.ancStart + 1, rg.sep) : null,
+                    theirsLines: lines.slice(rg.sep + 1, rg.end),
+                    oursLabel: rg.oursLabel,
+                    theirsLabel: rg.theirsLabel,
+                    ctxBefore: lines.slice(ctxStart, rg.start),
+                    ctxAfter: lines.slice(rg.end + 1, ctxEnd),
+                };
             });
+            files.push({ path: relPath, notice: null, regions });
         }
         catch {
-            files.push({ path: relPath, regions: [], lines: [], oversized: false, binary: false });
+            files.push({ path: relPath, notice: "nomarkers", regions: [] });
         }
     }
+    return files;
+}
+/**
+ * Normalizer B — build the unified model from a trial-merge ConflictFile[]
+ * (as produced by extractConflicts via `git merge-tree`). The region line
+ * numbers are the merged-file lines, identical to what the working tree would
+ * show after the merge.
+ */
+function conflictFilesFromExtract(conflicts, oursLabel, theirsLabel) {
+    const splitOrEmpty = (s) => (s === undefined || s === "") ? [] : s.split("\n");
+    return conflicts.map((cf) => {
+        if (cf.oversized)
+            return { path: cf.path, notice: "oversized", regions: [] };
+        if (cf.regions.length === 0)
+            return { path: cf.path, notice: "nomarkers", regions: [] };
+        const regions = cf.regions.map((r) => ({
+            startLine: r.startLine,
+            endLine: r.endLine,
+            oursLines: splitOrEmpty(r.baseContent),
+            ancestorLines: r.ancestorContent === undefined ? null : splitOrEmpty(r.ancestorContent),
+            theirsLines: splitOrEmpty(r.incomingContent),
+            oursLabel,
+            theirsLabel,
+            ctxBefore: r.contextBefore.slice(-CONFLICT_CONTEXT),
+            ctxAfter: r.contextAfter.slice(0, CONFLICT_CONTEXT),
+        }));
+        return { path: cf.path, notice: null, regions };
+    });
+}
+/**
+ * Shared markdown engine. Both conflict paths funnel through here, so the
+ * output is byte-for-byte consistent regardless of how the conflicts were
+ * found. Each conflict becomes a single line-numbered ```diff fence using the
+ * real file line numbers, with ours = `-`, theirs = `+`, the common ancestor
+ * shown as context, and every git marker turned into a labeled full-width rule.
+ */
+function composeConflictMarkdown(files, opts) {
+    const RULE_WIDTH = 66;
+    const { prNumber, oursName, theirsName, currentBranch, showQuickResolve } = opts;
     const totalRegions = files.reduce((s, f) => s + f.regions.length, 0);
-    const firstRegion = files.find(f => f.regions.length > 0)?.regions[0];
-    const oursName = currentBranch ?? context.baseBranch;
-    const theirsName = (context.headBranch && context.headBranch !== "HEAD")
-        ? context.headBranch
-        : (firstRegion?.theirsLabel ?? context.headBranch);
     const out = [];
     const w = (line = "") => out.push(line);
+    const rule = (prefix, ch) => {
+        const pad = Math.max(3, RULE_WIDTH - prefix.length);
+        return `${prefix} ${ch.repeat(pad)}`;
+    };
     // ── Header ──
     w(`# ⚠ Merge Conflicts${prNumber > 0 ? ` — PR #${prNumber}` : ""}`);
     w();
@@ -505,74 +557,72 @@ async function renderLocalConflicts(dir, conflictPaths, outputPath, prNumber, co
     w(`> Gutter numbers are the real file line numbers. \`-\` is ours, \`+\` is theirs.`);
     w();
     w("---");
-    const rule = (prefix, ch) => {
-        const pad = Math.max(3, RULE_WIDTH - prefix.length);
-        return `${prefix} ${ch.repeat(pad)}`;
-    };
     for (const file of files) {
         w();
-        const badge = file.oversized ? "⚠ oversized"
-            : file.binary ? "binary"
+        const badge = file.notice === "oversized" ? "⚠ oversized"
+            : file.notice === "nomarkers" ? "no inline markers"
                 : `${file.regions.length} conflict${file.regions.length !== 1 ? "s" : ""}`;
         w(`## 📁 \`${file.path}\`  ·  ${badge}`);
         w();
-        if (file.oversized) {
+        if (file.notice === "oversized") {
             w("> File exceeds 500 KB — content not shown.");
             continue;
         }
-        if (file.binary) {
-            w("> Binary file — no inline diff.");
-            continue;
-        }
-        if (file.regions.length === 0) {
-            w("> No inline conflict markers (delete/modify or rename conflict).");
+        if (file.notice === "nomarkers") {
+            w("> No inline conflict markers — binary, delete/modify, or rename conflict.");
             continue;
         }
         for (let r = 0; r < file.regions.length; r++) {
             const rg = file.regions[r];
-            const oursCount = (rg.ancStart !== -1 ? rg.ancStart : rg.sep) - rg.start - 1;
-            const theirsCount = rg.end - rg.sep - 1;
+            const oursCount = rg.oursLines.length;
+            const theirsCount = rg.theirsLines.length;
             let cls;
             if (oursCount === 0)
                 cls = `🟢 Incoming adds ${theirsCount} line${theirsCount !== 1 ? "s" : ""}; ours is empty here.`;
             else if (theirsCount === 0)
                 cls = `🔴 Incoming deletes ${oursCount} line${oursCount !== 1 ? "s" : ""} that ours keeps.`;
             else
-                cls = `⚡ Both sides edited this span${rg.ancStart !== -1 ? " (ancestor shown)" : ""}.`;
-            w(`### Conflict ${r + 1} of ${file.regions.length} · lines ${rg.start + 1}–${rg.end + 1}`);
+                cls = `⚡ Both sides edited this span${rg.ancestorLines !== null ? " (ancestor shown)" : ""}.`;
+            w(`### Conflict ${r + 1} of ${file.regions.length} · lines ${rg.startLine}–${rg.endLine}`);
             w();
             w(`> ${cls}`);
             w();
-            const ctxStart = Math.max(0, rg.start - CONTEXT);
-            const ctxEnd = Math.min(file.lines.length - 1, rg.end + CONTEXT);
-            const width = String(ctxEnd + 1).length;
+            const maxLine = rg.endLine + rg.ctxAfter.length;
+            const width = String(maxLine).length;
             const g = (n) => String(n).padStart(width);
-            const oursLabel = (rg.oursLabel === "HEAD" && currentBranch) ? currentBranch : rg.oursLabel;
-            const oursBoundary = rg.ancStart !== -1 ? rg.ancStart : rg.sep;
+            const oursLabel = (rg.oursLabel === "HEAD" || rg.oursLabel === "") ? (currentBranch ?? oursName) : rg.oursLabel;
+            const theirsLabel = rg.theirsLabel === "" ? theirsName : rg.theirsLabel;
+            let ln = rg.startLine - rg.ctxBefore.length;
             w("```diff");
-            for (let k = ctxStart; k <= ctxEnd; k++) {
-                const ln = k + 1;
-                const text = file.lines[k];
-                if (k === rg.start) {
-                    out.push(`${g(ln)}  ${rule(`<<<<<<< OURS · ${oursLabel}`, "═")}`);
+            for (const t of rg.ctxBefore) {
+                out.push(`${g(ln)}   ${t}`.replace(/\s+$/, ""));
+                ln++;
+            }
+            out.push(`${g(ln)}  ${rule(`<<<<<<< OURS · ${oursLabel}`, "═")}`);
+            ln++;
+            for (const t of rg.oursLines) {
+                out.push(`${g(ln)} - ${t}`.replace(/\s+$/, ""));
+                ln++;
+            }
+            if (rg.ancestorLines !== null) {
+                out.push(`${g(ln)}  ${rule("||||||| BASE · common ancestor", "─")}`);
+                ln++;
+                for (const t of rg.ancestorLines) {
+                    out.push(`${g(ln)}   ${t}`.replace(/\s+$/, ""));
+                    ln++;
                 }
-                else if (k === rg.ancStart) {
-                    out.push(`${g(ln)}  ${rule("||||||| BASE · common ancestor", "─")}`);
-                }
-                else if (k === rg.sep) {
-                    out.push(`${g(ln)}  ${rule(`======= THEIRS · ${rg.theirsLabel}`, "═")}`);
-                }
-                else if (k === rg.end) {
-                    out.push(`${g(ln)}  ${rule(">>>>>>> END", "═")}`);
-                }
-                else {
-                    let m = " ";
-                    if (k > rg.start && k < oursBoundary)
-                        m = "-"; // ours
-                    else if (k > rg.sep && k < rg.end)
-                        m = "+"; // theirs
-                    out.push(`${g(ln)} ${m} ${text}`.replace(/\s+$/, ""));
-                }
+            }
+            out.push(`${g(ln)}  ${rule(`======= THEIRS · ${theirsLabel}`, "═")}`);
+            ln++;
+            for (const t of rg.theirsLines) {
+                out.push(`${g(ln)} + ${t}`.replace(/\s+$/, ""));
+                ln++;
+            }
+            out.push(`${g(ln)}  ${rule(">>>>>>> END", "═")}`);
+            ln++;
+            for (const t of rg.ctxAfter) {
+                out.push(`${g(ln)}   ${t}`.replace(/\s+$/, ""));
+                ln++;
             }
             w("```");
             w();
@@ -586,21 +636,104 @@ async function renderLocalConflicts(dir, conflictPaths, outputPath, prNumber, co
     w("| File | Conflicts | Lines |");
     w("|------|-----------|-------|");
     for (const file of files) {
-        if (file.oversized)
+        if (file.notice === "oversized")
             w(`| \`${file.path}\` | ⚠ oversized | — |`);
-        else if (file.binary)
-            w(`| \`${file.path}\` | binary | — |`);
-        else if (file.regions.length === 0)
+        else if (file.notice === "nomarkers")
             w(`| \`${file.path}\` | delete/modify | — |`);
         else {
-            const spans = file.regions.map(rr => `L${rr.start + 1}–${rr.end + 1}`).join(", ");
+            const spans = file.regions.map(rr => `L${rr.startLine}–${rr.endLine}`).join(", ");
             w(`| \`${file.path}\` | ${file.regions.length} | ${spans} |`);
         }
     }
     w();
     w(`**Total:** ${files.length} file${files.length !== 1 ? "s" : ""} · ${totalRegions} conflict region${totalRegions !== 1 ? "s" : ""}`);
+    if (showQuickResolve && prNumber > 0) {
+        const fileArgs = files
+            .filter(f => f.notice !== "oversized")
+            .map(f => `--use-incoming ${f.path}`)
+            .join(" ");
+        w();
+        w("### Quick Resolve");
+        w();
+        w("Accept the incoming side for every file (swap to `--use-baseline` per file as needed):");
+        w();
+        w("```bash");
+        w(`git-print ${prNumber} ${fileArgs}`);
+        w("```");
+    }
     w();
-    await writeFile(outputPath, out.join("\n"), "utf-8");
+    return out.join("\n");
+}
+/**
+ * Local working-tree conflict report — fires whenever `git diff` shows
+ * unmerged files, regardless of GitHub's pr.mergeable value.
+ */
+async function renderLocalConflicts(dir, conflictPaths, outputPath, prNumber, context) {
+    const currentBranch = getCurrentBranch(dir);
+    const files = conflictFilesFromWorkingTree(dir, conflictPaths);
+    const firstRegion = files.find(f => f.regions.length > 0)?.regions[0];
+    const oursName = currentBranch ?? context.baseBranch;
+    const theirsName = (context.headBranch && context.headBranch !== "HEAD")
+        ? context.headBranch
+        : (firstRegion?.theirsLabel ?? context.headBranch);
+    const md = composeConflictMarkdown(files, {
+        prNumber, oursName, theirsName, currentBranch, showQuickResolve: false,
+    });
+    await writeFile(outputPath, md, "utf-8");
+    return outputPath;
+}
+/**
+ * Trial-merge conflict report — used when the working tree is clean but GitHub
+ * reports the PR as dirty. Runs the in-memory `git merge-tree` trial merge via
+ * extractConflicts(), then renders through the same engine as the local path.
+ * Mirrors the old renderConflicts() contract: returns the path, or null when
+ * there's nothing to report (and clears any stale file). The PR review
+ * pipeline is untouched.
+ */
+async function renderTrialMergeConflicts(data, opts) {
+    const { gitRoot, outputPath, pullNumber } = opts;
+    const { pr } = data;
+    if (!(pr.mergeable === false && pr.mergeable_state === "dirty")) {
+        try {
+            await unlink(outputPath);
+        }
+        catch { /* didn't exist */ }
+        return null;
+    }
+    const baseBranch = pr.base.ref;
+    const headBranch = pr.head.ref;
+    console.error(`Merge conflicts detected — running in-memory trial merge...`);
+    let conflicts;
+    try {
+        conflicts = extractConflicts(gitRoot, baseBranch, headBranch, {
+            baseSha: pr.base.sha,
+            headSha: pr.head.sha,
+            pullNumber,
+        });
+    }
+    catch (e) {
+        const minimal = `# ⚠ Merge Conflicts — PR #${pullNumber}\n\n\`${headBranch}\` does not merge cleanly into \`${baseBranch}\`\n\nCould not perform a local trial merge to extract conflict details.\nError: ${e.message}\n`;
+        await writeFile(outputPath, minimal, "utf-8");
+        return outputPath;
+    }
+    if (conflicts.length === 0) {
+        console.error(`Trial merge found no conflicts (API may be stale).`);
+        try {
+            await unlink(outputPath);
+        }
+        catch { /* fine */ }
+        return null;
+    }
+    const files = conflictFilesFromExtract(conflicts, baseBranch, headBranch);
+    const md = composeConflictMarkdown(files, {
+        prNumber: pullNumber,
+        oursName: baseBranch,
+        theirsName: headBranch,
+        currentBranch: null,
+        showQuickResolve: true,
+    });
+    await writeFile(outputPath, md, "utf-8");
+    console.error(`Written conflict report to ${outputPath} (${md.length} bytes)`);
     return outputPath;
 }
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -749,11 +882,11 @@ async function main() {
             console.error(`Written conflict report to PR-${prNumber}-conflicts.md`);
         }
         else if (pr.mergeable === false && pr.mergeable_state === "dirty") {
-            // No local conflicts but GitHub says the PR is dirty — run a trial merge
-            const cPath = await renderConflicts(data, {
-                ...baseOptions,
-                outputPath: conflictPath,
+            // No local conflicts but GitHub says the PR is dirty — in-memory trial merge
+            const cPath = await renderTrialMergeConflicts(data, {
                 gitRoot,
+                outputPath: conflictPath,
+                pullNumber: prNumber,
             });
             if (cPath) {
                 generatedPaths.push(cPath);

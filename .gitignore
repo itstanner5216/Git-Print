@@ -3,3 +3,10 @@ node_modules/
 references/
 test-artifacts/
 .mcp/
+
+# Local scratch / generated output (not part of the package)
+.bak/
+merge_files/
+review_results/
+RENDERING_FIXES_PLAN.md
+.git-print/

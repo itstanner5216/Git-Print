@@ -298,6 +298,12 @@ export function resolve(alias: string, worktreeName?: string): string {
   return path;
 }
 
+/** Return all registered repos as {alias, path} pairs (top-level repos only). */
+export function getRepos(): { alias: string; path: string }[] {
+  const entries = read();
+  return allKVInSection(entries, "Repos").map(kv => ({ alias: kv.key, path: kv.value }));
+}
+
 /** Print a human-readable list of all registered repos + worktrees. */
 export function list(): void {
   const entries = read();

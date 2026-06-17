@@ -1,6 +1,6 @@
 {
   "name": "git-print",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Render GitHub PR conversation and CI/commits/files report as plain text",
   "type": "module",
   "main": "dist/pr-renderer.js",

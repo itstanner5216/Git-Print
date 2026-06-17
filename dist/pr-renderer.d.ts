@@ -119,7 +119,19 @@ export interface ConflictFile {
     path: string;
     regions: ConflictRegion[];
     oversized: boolean;
+    /** Per-result-line side numbers: the real line number of each conflict line
+     *  in the clean OURS / THEIRS / BASE blobs. Context lines come from git's
+     *  combined diff; conflict-block lines are located structurally inside the
+     *  exact local blobs (so shared lines never tangle and BASE is numbered).
+     *  Optional: absent → renderer falls back to merged-file line numbers. */
+    sideMap?: SideLineMap;
 }
+/** result-line (1-based) → real per-side file line numbers. */
+export type SideLineMap = Map<number, {
+    ours: number | null;
+    theirs: number | null;
+    base: number | null;
+}>;
 export interface ResolveOptions {
     gitRoot: string;
     owner: string;
@@ -225,6 +237,49 @@ interface PrRefSpec {
     /** PR number; used to namespace the private refs we fetch into. */
     pullNumber: number;
 }
+/**
+ * Parse a git *combined* diff (the `@@@ -ours -theirs +result @@@` form git
+ * emits for a conflicted / merge file) into a per-result-line side-number map:
+ * `resultLine → { ours, theirs }`. A line present in a side carries that side's
+ * real file line number; lines absent from a side (conflict markers, the zdiff3
+ * BASE block, the OTHER side's content) carry `null` there. This is the local,
+ * git-computed source of per-side conflict line numbers — no GitHub API.
+ *
+ * Two-parent combined diff only (ours = parent1 / column 1, theirs = parent2 /
+ * column 2) — exactly what a 2-way merge (base↔head) produces. Octopus merges
+ * (≥3 parents) don't match the header and yield an empty map (→ caller falls
+ * back to merged-file numbers).
+ */
+export declare function parseCombinedDiffSideMap(diffText: string): Map<number, {
+    ours: number | null;
+    theirs: number | null;
+}>;
+/** Split a git blob/file into lines WITHOUT a phantom trailing element, so line
+ *  counts match git's own (a terminal "\n" does not add a line). */
+export declare function splitGitLines(text: string): string[];
+/** Read a git object (`<rev>:<path>`, `:N:<path>` stage blob, …) as lines.
+ *  No trimming — exact line counts matter. undefined when the object is absent
+ *  (e.g. a missing stage in an add/add, rename, or delete/modify conflict). */
+export declare function readBlobLines(cwd: string, spec: string): string[] | undefined;
+/**
+ * Build the unified per-result-line side map for one conflicted file.
+ *
+ * Context lines (outside the markers) take their ours/theirs numbers from git's
+ * combined diff — reliable there, and the cheapest source. Conflict-block lines
+ * are numbered STRUCTURALLY: each ours/theirs/base block is content-located in
+ * its own clean blob and counted sequentially from the located start. Because
+ * the three sides are located in three separate blobs, shared lines can never
+ * cross-tangle (the combined-diff failure mode), and BASE — which has no column
+ * in a combined diff at all — is numbered like any other side.
+ */
+export declare function buildSideLineMap(mergedContent: string, combined: Map<number, {
+    ours: number | null;
+    theirs: number | null;
+}> | undefined, blobs: {
+    ours?: string[];
+    base?: string[];
+    theirs?: string[];
+}): SideLineMap;
 /**
  * Detect conflict regions for the PR via an in-memory trial merge.
  *

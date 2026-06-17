@@ -474,35 +474,43 @@ function diffLines(a, b) {
 // duplicates of codeContextDiffLines / suggestionDiffBlocks; their line-number
 // and @@-header rendering now lives in those live functions.)
 /**
- * Lines ready to drop inside a ```diff fence: the hunk rows GitHub anchors the
- * comment to, each carrying its line-number gutter exactly as the PR page
- * shows it — `155 + content` (new-file number for added/context rows, old-file
- * number for removed rows). Numbers are right-aligned across the block.
+ * Render NumberedRow[] into ```diff-fence lines, each carrying its line-number
+ * gutter exactly as the PR page shows it — `155 + content` (new-file number for
+ * added/context rows, old-file number for removed rows). Numbers are
+ * right-aligned across the block. Shared by codeContextDiffLines (the anchored
+ * hunk) and suggestionDiffBlocks (the suggested changeset) so BOTH diff blocks
+ * in a comment render in one identical, numbered style.
  */
-function codeContextDiffLines(diffHunk, rangeSize) {
-    const hunk = parseHunkHeader(diffHunk);
-    if (!hunk) {
-        return (diffHunk || "").split("\n").filter((l) => l && !l.startsWith("@@"));
-    }
-    const rows = numberHunkRows(hunk);
-    const shown = rows.slice(-Math.max(4, rangeSize));
-    const width = Math.max(...shown.map((r) => {
+function renderNumberedRows(rows) {
+    const width = Math.max(...rows.map((r) => {
         const num = r.marker === "-" ? r.oldNum : r.newNum;
         return num != null ? String(num).length : 0;
     }), 1);
-    return shown.map((r) => {
+    return rows.map((r) => {
         const num = r.marker === "-" ? r.oldNum : r.newNum;
         const gutter = (num != null ? String(num) : "").padStart(width);
         return `${gutter} ${r.marker} ${r.content}`.trimEnd();
     });
 }
 /**
- * For each ```suggestion fence in a comment body, produce the unified diff
- * GitHub shows when previewing the change, ready to drop inside a ```diff
- * fence: a recomputed `@@ -a,b +c,d @@` header, a few lines of leading
- * context from the hunk, then a minimal -/+ diff between the anchored
- * original lines and the suggested replacement — NOT a raw dump of the API
- * diff hunk.
+ * Lines ready to drop inside a ```diff fence: the hunk rows GitHub anchors the
+ * comment to, numbered via renderNumberedRows (the shared gutter contract).
+ */
+function codeContextDiffLines(diffHunk, rangeSize) {
+    const hunk = parseHunkHeader(diffHunk);
+    if (!hunk) {
+        return (diffHunk || "").split("\n").filter((l) => l && !l.startsWith("@@"));
+    }
+    const shown = numberHunkRows(hunk).slice(-Math.max(4, rangeSize));
+    return renderNumberedRows(shown);
+}
+/**
+ * For each ```suggestion fence in a comment body, produce the suggested
+ * changeset GitHub shows when previewing the change, ready to drop inside a
+ * ```diff fence: a few leading context lines from the hunk, then a minimal
+ * -/+ diff between the anchored original lines and the suggested replacement.
+ * Numbered with the SAME gutter as codeContextDiffLines (via renderNumberedRows)
+ * — no raw @@ header; the "Suggested changeset N" caption labels the block.
  */
 function suggestionDiffBlocks(body, diffHunk, startLine, endLine) {
     const suggestions = parseSuggestions(body || "", diffHunk || "", startLine, endLine);
@@ -520,22 +528,35 @@ function suggestionDiffBlocks(body, diffHunk, startLine, endLine) {
                 .map((r) => r.content)
                 .slice(-CONTEXT);
         }
-        const rows = diffLines(original, replacement);
-        const lines = [];
-        const oldLen = before.length + original.length;
-        const newLen = before.length + replacement.length;
         const displayStart = anchorStart != null
             ? Math.max(1, anchorStart - before.length)
             : (hunk ? hunk.newStart : 1);
-        const headingSuffix = hunk && hunk.heading ? ` ${hunk.heading}` : "";
-        lines.push(`@@ -${displayStart},${oldLen} +${displayStart},${newLen} @@${headingSuffix}`);
-        for (const c of before)
-            lines.push(` ${c}`);
-        for (const row of rows) {
-            const prefix = row.type === "del" ? "-" : row.type === "add" ? "+" : " ";
-            lines.push(`${prefix}${row.text}`);
+        // Leading context numbers from displayStart (== the first before-row's real
+        // new-file line); the -/+ diff then starts at anchorStart on both counters.
+        const rows = [];
+        let oldNum = displayStart;
+        let newNum = displayStart;
+        for (const c of before) {
+            rows.push({ oldNum, newNum, marker: " ", content: c });
+            oldNum++;
+            newNum++;
         }
-        blocks.push(lines);
+        for (const d of diffLines(original, replacement)) {
+            if (d.type === "del") {
+                rows.push({ oldNum, newNum: null, marker: "-", content: d.text });
+                oldNum++;
+            }
+            else if (d.type === "add") {
+                rows.push({ oldNum: null, newNum, marker: "+", content: d.text });
+                newNum++;
+            }
+            else {
+                rows.push({ oldNum, newNum, marker: " ", content: d.text });
+                oldNum++;
+                newNum++;
+            }
+        }
+        blocks.push(renderNumberedRows(rows));
     }
     return blocks;
 }
@@ -565,6 +586,18 @@ function actorSuffix(user) {
 function displayActor(user) {
     const login = String(user?.login || "").replace(/\[bot\]$/i, "");
     return `${login}${actorSuffix(user)}`;
+}
+/** A single actor glyph for comment headers, mirroring actorSuffix's split:
+ *  🦾 AI reviewer (Copilot), 🤖 other bots, 🧑 humans. Lets a reader scan
+ *  who-said-what at a glance without re-reading the [AI]/[Bot] badge. */
+function actorEmoji(user) {
+    if (!user)
+        return "🧑";
+    if (/copilot/i.test(user.login || ""))
+        return "🦾";
+    if (user.type === "Bot" || /\[bot\]$/i.test(user.login || ""))
+        return "🤖";
+    return "🧑";
 }
 // ─── Timeline construction ───────────────────────────────────────────────────
 function buildCards(issueComments, reviews, reviewComments, resolvedMap, includeResolved) {
@@ -851,6 +884,8 @@ export function cleanCommentBody(raw) {
     s = transformProse(s, (seg) => seg
         .replace(/[ \t]*<a\b[^>]*>\s*<\/a>/gi, "")
         .replace(/<a\b[^>]*>([\s\S]*?)<\/a>/gi, "$1")
+        .replace(/<(?:b|strong)>\s*<(?:i|em)>([\s\S]*?)<\/(?:i|em)>\s*<\/(?:b|strong)>/gi, (_m, x) => "`" + x.replace(/<[^>]+>/g, "").replace(/`/g, "").trim() + "`")
+        .replace(/<(?:i|em)>\s*<(?:b|strong)>([\s\S]*?)<\/(?:b|strong)>\s*<\/(?:i|em)>/gi, (_m, x) => "`" + x.replace(/<[^>]+>/g, "").replace(/`/g, "").trim() + "`")
         .replace(/<\/?(?:strong|b)>/gi, "**")
         .replace(/<\/?(?:em|i)>/gi, "*")
         .replace(/<code>([\s\S]*?)<\/code>/gi, (_m, x) => "`" + x.replace(/`/g, "").trim() + "`")
@@ -858,7 +893,14 @@ export function cleanCommentBody(raw) {
         .replace(/<li>([\s\S]*?)<\/li>/gi, (_m, x) => `- ${x.trim()}\n`)
         .replace(/<br\s*\/?>/gi, "\n"));
     // Strip any remaining stray tags but keep their inner text. Fence-guarded.
-    s = transformProse(s, (seg) => seg.replace(/<\/?(?:details|summary|div|span|sub|sup|p|kbd|samp|blockquote|ul|ol|li|h[1-6]|code|strong|b|em|i|hr|abbr|small|table|thead|tbody|tr|td|th)\b[^>]*>/gi, ""));
+    // `pre` is included: Qodo wraps finding prose in <pre>…</pre>, which we want
+    // as plain prose (its inner <b><i>identifiers</i></b> are already inline code
+    // by this point), NOT a literal code block.
+    s = transformProse(s, (seg) => seg.replace(/<\/?(?:details|summary|div|span|sub|sup|p|pre|kbd|samp|blockquote|ul|ol|li|h[1-6]|code|strong|b|em|i|hr|abbr|small|table|thead|tbody|tr|td|th)\b[^>]*>/gi, ""));
+    // Un-escape bot-escaped leading list markers ("1\." → "1.") so numbered
+    // findings (Qodo) read as real markdown instead of backslash noise.
+    // Line-anchored to the leading number, so mid-prose escaped periods are safe.
+    s = transformProse(s, (seg) => seg.replace(/^(\s*\d+)\\\.(\s)/gm, "$1.$2"));
     // Line-level removal of pure marketing / bot-status noise (ignoring any
     // leading blockquote `>` prefix).
     //
@@ -999,7 +1041,7 @@ export async function renderPR(data, options) {
         const outdatedTag = thread.isOutdated && !resolved ? " _(outdated)_" : "";
         const severity = extractSeverity(proseOnly(root.body || ""));
         const severityTag = severity ? ` · Severity: ${severity}` : "";
-        w(`**${displayActor(root.user)}** reviewed · ${formatDate(root.created_at)}${severityTag}`);
+        w(`${actorEmoji(root.user)} **${displayActor(root.user)}** reviewed · ${formatDate(root.created_at)}${severityTag}`);
         blank();
         w(`\`${filePath}\` — ${lineAnchor(root)}${outdatedTag}`);
         blank();
@@ -1028,7 +1070,7 @@ export async function renderPR(data, options) {
         for (const reply of thread.replies) {
             const rSeverity = extractSeverity(proseOnly(reply.body || ""));
             const rSeverityTag = rSeverity ? ` · Severity: ${rSeverity}` : "";
-            w(`**${displayActor(reply.user)}** replied · ${formatDate(reply.created_at)}${rSeverityTag}`);
+            w(`${actorEmoji(reply.user)} **${displayActor(reply.user)}** replied · ${formatDate(reply.created_at)}${rSeverityTag}`);
             blank();
             const rbody = cleanCommentBody(stripSeverityLine(stripSuggestionBlocks(reply.body || "")));
             if (rbody) {
@@ -1072,9 +1114,9 @@ export async function renderPR(data, options) {
     w(`- **Milestone:** ${milestone}`);
     w("- **Development:** No linked issues");
     // ── Comments (scroll order; resolved threads deferred to their own section) ───
-    // Buffered: the heading prints only when a card survives cleaning — a PR
-    // whose every comment is promo-only (or purely resolved) gets no empty
-    // "## Comments" stub.
+    // Buffered: the `---` divider prints only when a card survives cleaning — a
+    // PR whose every comment is promo-only (or purely resolved) gets no empty
+    // divider stub.
     const commentBuf = [];
     const resolvedThreads = [];
     let n = 1;
@@ -1094,7 +1136,7 @@ export async function renderPR(data, options) {
             body = cleanCommentBody(c.body || "");
             if (!body)
                 continue;
-            header = `**${displayActor(c.user)}** commented · ${formatDate(c.created_at)}`;
+            header = `${actorEmoji(c.user)} **${displayActor(c.user)}** commented · ${formatDate(c.created_at)}`;
         }
         else if (card.kind === "review_event") {
             const r = card.data;
@@ -1103,7 +1145,7 @@ export async function renderPR(data, options) {
             const hasVerdict = verdict === "CHANGES_REQUESTED" || verdict === "APPROVED" || verdict === "DISMISSED";
             if (!body && !hasVerdict)
                 continue;
-            header = `**${displayActor(r.user)}** ${reviewVerb(r.state)} · ${formatDate(r.submitted_at || r.created_at)}`;
+            header = `${actorEmoji(r.user)} **${displayActor(r.user)}** ${reviewVerb(r.state)} · ${formatDate(r.submitted_at || r.created_at)}`;
         }
         blank();
         w(`### Comment #${n++}`);
@@ -1123,8 +1165,6 @@ export async function renderPR(data, options) {
     if (commentBuf.length > 0) {
         blank();
         w("---");
-        blank();
-        w("## Comments");
         out.push(...commentBuf);
     }
     // ── Resolved threads (own section; omitted entirely when there are none) ──────
@@ -1231,6 +1271,74 @@ function extractFailureLines(text, maxLines = 20) {
     }
     return result.slice(0, maxLines * 3); // cap total output
 }
+/**
+ * Fetch the raw plain-text logs for a single GitHub Actions job.
+ *
+ * The `/actions/jobs/{id}/logs` endpoint returns a 302 redirect to a short-lived
+ * signed storage URL (Azure blob). We follow it manually and DROP the
+ * Authorization header on the redirect hop — the signed URL carries its own SAS
+ * token and rejects requests that also send `Authorization: Bearer`.
+ *
+ * Returns the log text, or null on any failure (missing perms, 404, network).
+ * Never throws — log retrieval is best-effort enrichment.
+ */
+async function fetchJobLog(owner, repo, jobId, token, rl = createRateLimitState()) {
+    try {
+        await waitForRateLimit(rl);
+        const url = `${API_BASE}/repos/${owner}/${repo}/actions/jobs/${jobId}/logs`;
+        const headers = {
+            Accept: "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        };
+        if (token)
+            headers.Authorization = `Bearer ${token}`;
+        const res = await fetch(url, { headers, redirect: "manual" });
+        updateRateLimit(res.headers, rl);
+        if (res.status === 301 || res.status === 302 || res.status === 307 || res.status === 308) {
+            const loc = res.headers.get("location");
+            if (!loc)
+                return null;
+            const dl = await fetch(loc); // no auth header — signed URL
+            if (!dl.ok)
+                return null;
+            return await dl.text();
+        }
+        // Some runtimes auto-follow despite redirect:"manual"; accept a 200 body too.
+        if (res.ok)
+            return await res.text();
+        return null;
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * Normalize a raw GitHub Actions job log for display: strip per-line ISO
+ * timestamps and ANSI color codes, drop ##[group]/##[endgroup] fold markers and
+ * common runner noise (cache download progress, which otherwise trips the
+ * "Received" assertion keyword), and turn ##[error]/##[warning] workflow-command
+ * markers into readable prefixes.
+ */
+function cleanActionsLog(text) {
+    // Runner spam that adds no debugging value and can false-match failure keywords.
+    const NOISE = [
+        /^Received \d[\d,]* of \d/, // cache download progress (matches "Received")
+        /\b\d+(?:\.\d+)? MBs?\/sec\b/, // throughput readouts
+        /^Cache (?:hit|Size|restored|saved|not found)/i,
+        /^(?:Restoring|Requesting|Saving) cache/i,
+    ];
+    return text
+        .replace(/\r/g, "") // drop carriage returns
+        .replace(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z /gm, "") // strip ISO timestamps
+        // eslint-disable-next-line no-control-regex
+        .replace(/\x1b\[[0-9;]*[A-Za-z]/g, "") // strip ANSI escape codes
+        .replace(/^##\[(?:group|endgroup)\].*$/gm, "") // drop fold markers
+        .replace(/^##\[error\]/gm, "ERROR: ")
+        .replace(/^##\[warning\]/gm, "WARNING: ")
+        .split("\n")
+        .filter((l) => !NOISE.some((re) => re.test(l)))
+        .join("\n");
+}
 export async function renderReport(data, options) {
     const { pr, commits, files, unifiedChecks, rateLimitState: rl } = data;
     const { owner, repo, token, outputPath } = options;
@@ -1239,12 +1347,12 @@ export async function renderReport(data, options) {
     const out = [];
     const w = (line = "") => out.push(line);
     // ─── 1. CI Status ──────────────────────────────────────────────────────
-    w(`CI STATUS — PR #${pr.number}`);
+    w(`# CI STATUS — PR #${pr.number}`);
     w();
     const { inProgress, passed, failed } = categorizeChecks(unifiedChecks);
     // Failed checks with detailed failure info
     if (failed.length > 0) {
-        w(`FAILED (${failed.length}):`);
+        w(`## FAILED (${failed.length}):`);
         w();
         for (const fc of failed) {
             const dur = formatDuration(fc.startedAt, fc.completedAt);
@@ -1253,10 +1361,27 @@ export async function renderReport(data, options) {
                 w(`    Duration: ${dur}`);
             w(`    Failure details:`);
             let hasDetails = false;
+            let genericAnns = [];
             // Priority 1: Annotations
             if (fc.checkRunId) {
                 try {
-                    const anns = await fetchAllPages(`${base}/check-runs/${fc.checkRunId}/annotations`, token, rl);
+                    const allAnns = await fetchAllPages(`${base}/check-runs/${fc.checkRunId}/annotations`, token, rl);
+                    // Keep only real failures — drop advisory warning/notice annotations
+                    // (e.g. the "Node.js 20 actions are deprecated" runner spam) that bury
+                    // the actual failure lines.
+                    const failureAnns = allAnns.filter((a) => (a.annotation_level || "failure").toLowerCase() === "failure");
+                    // GitHub auto-emits a useless "Process completed with exit code N"
+                    // annotation that points at the workflow YAML (.github/...). Set those
+                    // aside so they don't mask the real failure — fall through to the job
+                    // log instead, and only surface them as a last resort.
+                    const isGenericStepFailure = (a) => {
+                        const msg = a.message || a.title || "";
+                        const p = a.path || "";
+                        return /process completed with exit code/i.test(msg) ||
+                            p === ".github" || p.startsWith(".github/");
+                    };
+                    genericAnns = failureAnns.filter(isGenericStepFailure);
+                    const anns = failureAnns.filter((a) => !isGenericStepFailure(a));
                     if (anns.length > 0) {
                         hasDetails = true;
                         for (const ann of anns) {
@@ -1322,8 +1447,48 @@ export async function renderReport(data, options) {
                     console.error(`Warning: Could not fetch check run detail for ${fc.name}: ${e.message}`);
                 }
             }
+            // Priority 3: raw GitHub Actions job logs. Covers the common case of a
+            // plain test runner (pytest/jest/go test) that exits non-zero but emits
+            // neither annotations nor output.text. details_url for an Actions check is
+            // .../actions/runs/<run_id>/job/<job_id> — we parse the job id from it.
+            if (!hasDetails && fc.detailsUrl) {
+                const jobIdMatch = fc.detailsUrl.match(/\/job\/(\d+)/);
+                if (jobIdMatch) {
+                    try {
+                        const logText = await fetchJobLog(owner, repo, jobIdMatch[1], token, rl);
+                        if (logText) {
+                            // Failures + summaries live near the end; cap input to avoid
+                            // pathological memory on multi-MB logs.
+                            const MAX = 1_000_000;
+                            const sliced = logText.length > MAX ? logText.slice(-MAX) : logText;
+                            const extracted = extractFailureLines(cleanActionsLog(sliced));
+                            if (extracted.length > 0) {
+                                hasDetails = true;
+                                w(`      ── from job log ──`);
+                                for (const line of extracted) {
+                                    w(`      ${line}`);
+                                }
+                                w();
+                            }
+                        }
+                    }
+                    catch (e) {
+                        console.error(`Warning: Could not fetch job log for ${fc.name}: ${e.message}`);
+                    }
+                }
+            }
             if (!hasDetails) {
-                if (fc.description) {
+                if (genericAnns.length > 0) {
+                    // Last resort: the only machine-readable signal is the generic
+                    // exit-code annotation. Better than nothing.
+                    for (const ann of genericAnns) {
+                        const loc = ann.path && ann.start_line ? `${ann.path}:${ann.start_line}` : null;
+                        if (loc)
+                            w(`      [${ann.annotation_level || "failure"}] ${loc}`);
+                        w(`      ${ann.message || ann.title || "(no message)"}`);
+                    }
+                }
+                else if (fc.description) {
                     w(`      ${fc.description}`);
                 }
                 else {
@@ -1335,7 +1500,7 @@ export async function renderReport(data, options) {
     }
     // Passed checks
     if (passed.length > 0) {
-        w(`PASSED (${passed.length}):`);
+        w(`## PASSED (${passed.length}):`);
         for (const c of passed) {
             const dur = formatDuration(c.startedAt, c.completedAt);
             const durStr = dur ? ` — ${dur}` : "";
@@ -1345,7 +1510,7 @@ export async function renderReport(data, options) {
     }
     // In-progress checks
     if (inProgress.length > 0) {
-        w(`IN PROGRESS (${inProgress.length}):`);
+        w(`## IN PROGRESS (${inProgress.length}):`);
         for (const c of inProgress) {
             const desc = c.description ? ` — ${c.description}` : "";
             w(`  ~ ${c.name}${desc}`);
@@ -1389,7 +1554,10 @@ export async function renderReport(data, options) {
     for (let i = 0; i < commits.length; i++) {
         const c = commits[i];
         const sha = c.sha.slice(0, 7);
-        const authorName = c.commit?.author?.name || c.author?.login || "Unknown";
+        // Prefer the GitHub handle (consistent with the rest of the report, which
+        // uses logins everywhere); fall back to the git author name only for
+        // commits not linked to a GitHub account.
+        const authorName = c.author?.login || c.commit?.author?.name || "Unknown";
         const timestamp = formatDate(c.commit?.author?.date || c.commit?.committer?.date || "");
         const firstLine = (c.commit?.message || "").split("\n")[0];
         w(`${String(i + 1).padStart(2)}.  ${sha}  ${authorName}  ${timestamp}`);
@@ -1671,6 +1839,269 @@ function getStagedFingerprint(workTree, path) {
     return { kind: "blob", mode: m[1], oid: m[2] };
 }
 // ─── extractConflicts — trial merge in temp worktree ─────────────────────────
+// Context lines requested when synthesizing the combined diff for the per-side
+// line map. Must comfortably exceed the renderer's CONFLICT_CONTEXT (3) so
+// every displayed context line is covered by a hunk and gets a real number.
+const SIDEMAP_CONTEXT = 8;
+/**
+ * Parse a git *combined* diff (the `@@@ -ours -theirs +result @@@` form git
+ * emits for a conflicted / merge file) into a per-result-line side-number map:
+ * `resultLine → { ours, theirs }`. A line present in a side carries that side's
+ * real file line number; lines absent from a side (conflict markers, the zdiff3
+ * BASE block, the OTHER side's content) carry `null` there. This is the local,
+ * git-computed source of per-side conflict line numbers — no GitHub API.
+ *
+ * Two-parent combined diff only (ours = parent1 / column 1, theirs = parent2 /
+ * column 2) — exactly what a 2-way merge (base↔head) produces. Octopus merges
+ * (≥3 parents) don't match the header and yield an empty map (→ caller falls
+ * back to merged-file numbers).
+ */
+export function parseCombinedDiffSideMap(diffText) {
+    const map = new Map();
+    let oursNum = 0, theirsNum = 0, resultNum = 0, inHunk = false;
+    for (const line of diffText.split("\n")) {
+        const h = line.match(/^@@@ -(\d+)(?:,\d+)? -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@@/);
+        if (h) {
+            oursNum = parseInt(h[1], 10);
+            theirsNum = parseInt(h[2], 10);
+            resultNum = parseInt(h[3], 10);
+            inHunk = true;
+            continue;
+        }
+        if (!inHunk)
+            continue;
+        if (line.startsWith("\\"))
+            continue; // "\ No newline at end of file"
+        if (line.length < 2) {
+            inHunk = false;
+            continue;
+        } // end of hunk body
+        const c1 = line[0], c2 = line[1];
+        if ("+- ".indexOf(c1) === -1 || "+- ".indexOf(c2) === -1) {
+            inHunk = false;
+            continue;
+        }
+        const inResult = c1 !== "-" && c2 !== "-"; // present in the merged result
+        // "Present in side i?" differs by line kind: on a RESULT line a space means
+        // "unchanged from parent i" (present); a '+' means added (absent). On a
+        // REMOVED line (some column is '-') only the '-' column is actually present
+        // in that parent — the other column is alignment padding, NOT presence.
+        const inOurs = inResult ? c1 === " " : c1 === "-";
+        const inTheirs = inResult ? c2 === " " : c2 === "-";
+        if (inResult) {
+            map.set(resultNum, { ours: inOurs ? oursNum : null, theirs: inTheirs ? theirsNum : null });
+            resultNum++;
+        }
+        if (inOurs)
+            oursNum++;
+        if (inTheirs)
+            theirsNum++;
+    }
+    return map;
+}
+// ─── Structural per-side line numbers (content-located in clean blobs) ────────
+/** Split a git blob/file into lines WITHOUT a phantom trailing element, so line
+ *  counts match git's own (a terminal "\n" does not add a line). */
+export function splitGitLines(text) {
+    const lines = text.split("\n");
+    if (lines.length > 0 && lines[lines.length - 1] === "")
+        lines.pop();
+    return lines;
+}
+/** Read a git object (`<rev>:<path>`, `:N:<path>` stage blob, …) as lines.
+ *  No trimming — exact line counts matter. undefined when the object is absent
+ *  (e.g. a missing stage in an add/add, rename, or delete/modify conflict). */
+export function readBlobLines(cwd, spec) {
+    try {
+        const out = execFileSync("git", ["show", spec], {
+            cwd, encoding: "utf-8", timeout: GIT_LOCAL_TIMEOUT,
+            stdio: ["pipe", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024,
+        }).toString();
+        return splitGitLines(out);
+    }
+    catch {
+        return undefined;
+    }
+}
+/** Scan conflict-marker quartets from merged-file lines (0-based indices). */
+function scanConflictMarkerLines(lines) {
+    const out = [];
+    let i = 0;
+    while (i < lines.length) {
+        if (!lines[i].startsWith("<<<<<<<")) {
+            i++;
+            continue;
+        }
+        const start = i;
+        let ancStart = -1, sep = -1, end = -1, j = i + 1;
+        while (j < lines.length) {
+            const l = lines[j];
+            if (l.startsWith("|||||||") && ancStart === -1 && sep === -1)
+                ancStart = j;
+            else if (l.startsWith("=======") && sep === -1)
+                sep = j;
+            else if (l.startsWith(">>>>>>>")) {
+                end = j;
+                break;
+            }
+            j++;
+        }
+        if (sep === -1 || end === -1) {
+            i = start + 1;
+            continue;
+        }
+        out.push({ start, ancStart, sep, end });
+        i = end + 1;
+    }
+    return out;
+}
+/**
+ * Locate a conflict block (a contiguous run of lines extracted verbatim by git
+ * from one side's clean blob) inside that blob, returning its 0-based start
+ * index — or null when it can't be pinned down unambiguously.
+ *
+ * A conflict block IS, by construction, an exact contiguous slice of its side's
+ * clean blob, so we match it literally. Duplicates are disambiguated by (1) a
+ * monotonic lower bound from earlier blocks of the same side and (2) how much
+ * of the surrounding shared context lines up on either side. If two candidates
+ * remain tied we return null (blank gutter) — a blank is always better than a
+ * wrong line number.
+ */
+function locateBlock(blob, block, ctxBefore, ctxAfter, minStart) {
+    if (!blob || block.length === 0)
+        return null;
+    const matches = [];
+    for (let i = 0; i + block.length <= blob.length; i++) {
+        let ok = true;
+        for (let j = 0; j < block.length; j++) {
+            if (blob[i + j] !== block[j]) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok)
+            matches.push(i);
+    }
+    if (matches.length === 0)
+        return null;
+    let pool = matches.filter(m => m >= minStart);
+    if (pool.length === 0)
+        pool = matches;
+    if (pool.length === 1)
+        return pool[0];
+    // Disambiguate by how many adjacent shared-context lines line up.
+    const score = (m) => {
+        let s = 0;
+        for (let k = 1; k <= ctxBefore.length; k++) {
+            const bi = m - k, ci = ctxBefore.length - k;
+            if (bi >= 0 && blob[bi] === ctxBefore[ci])
+                s++;
+            else
+                break;
+        }
+        for (let k = 0; k < ctxAfter.length; k++) {
+            const bi = m + block.length + k;
+            if (bi < blob.length && blob[bi] === ctxAfter[k])
+                s++;
+            else
+                break;
+        }
+        return s;
+    };
+    let best = pool[0], bestScore = score(pool[0]), tie = false;
+    for (let x = 1; x < pool.length; x++) {
+        const sc = score(pool[x]);
+        if (sc > bestScore) {
+            best = pool[x];
+            bestScore = sc;
+            tie = false;
+        }
+        else if (sc === bestScore)
+            tie = true;
+    }
+    return tie ? null : best;
+}
+/**
+ * Build the unified per-result-line side map for one conflicted file.
+ *
+ * Context lines (outside the markers) take their ours/theirs numbers from git's
+ * combined diff — reliable there, and the cheapest source. Conflict-block lines
+ * are numbered STRUCTURALLY: each ours/theirs/base block is content-located in
+ * its own clean blob and counted sequentially from the located start. Because
+ * the three sides are located in three separate blobs, shared lines can never
+ * cross-tangle (the combined-diff failure mode), and BASE — which has no column
+ * in a combined diff at all — is numbered like any other side.
+ */
+export function buildSideLineMap(mergedContent, combined, blobs) {
+    const CTX = 3; // shared-context window used only for disambiguation
+    const lines = mergedContent.split("\n");
+    const regions = scanConflictMarkerLines(lines);
+    const map = new Map();
+    // Seed context lines from the combined diff (block interiors are overwritten
+    // below, so any tangled combined-diff values inside blocks are discarded).
+    if (combined) {
+        for (const [ln, v] of combined)
+            map.set(ln, { ours: v.ours, theirs: v.theirs, base: null });
+    }
+    const minStart = { ours: 0, base: 0, theirs: 0 };
+    for (let r = 0; r < regions.length; r++) {
+        const rg = regions[r];
+        const oursBoundary = rg.ancStart >= 0 ? rg.ancStart : rg.sep;
+        const oursBlock = lines.slice(rg.start + 1, oursBoundary);
+        const baseBlock = rg.ancStart >= 0 ? lines.slice(rg.ancStart + 1, rg.sep) : [];
+        const theirsBlock = lines.slice(rg.sep + 1, rg.end);
+        const prevEnd = r > 0 ? regions[r - 1].end : -1;
+        const nextStart = r < regions.length - 1 ? regions[r + 1].start : lines.length;
+        const ctxBefore = lines.slice(Math.max(0, rg.start - CTX, prevEnd + 1), rg.start);
+        const ctxAfter = lines.slice(rg.end + 1, Math.min(lines.length, rg.end + 1 + CTX, nextStart));
+        // OURS block: 1-based result lines begin at (rg.start + 2).
+        {
+            const s = locateBlock(blobs.ours, oursBlock, ctxBefore, ctxAfter, minStart.ours);
+            if (s != null)
+                minStart.ours = s + oursBlock.length;
+            for (let i = 0; i < oursBlock.length; i++) {
+                map.set(rg.start + 2 + i, { ours: s != null ? s + 1 + i : null, theirs: null, base: null });
+            }
+        }
+        // BASE block: 1-based result lines begin at (rg.ancStart + 2).
+        if (rg.ancStart >= 0) {
+            const s = locateBlock(blobs.base, baseBlock, ctxBefore, ctxAfter, minStart.base);
+            if (s != null)
+                minStart.base = s + baseBlock.length;
+            for (let i = 0; i < baseBlock.length; i++) {
+                map.set(rg.ancStart + 2 + i, { ours: null, theirs: null, base: s != null ? s + 1 + i : null });
+            }
+        }
+        // THEIRS block: 1-based result lines begin at (rg.sep + 2).
+        {
+            const s = locateBlock(blobs.theirs, theirsBlock, ctxBefore, ctxAfter, minStart.theirs);
+            if (s != null)
+                minStart.theirs = s + theirsBlock.length;
+            for (let i = 0; i < theirsBlock.length; i++) {
+                map.set(rg.sep + 2 + i, { ours: null, theirs: s != null ? s + 1 + i : null, base: null });
+            }
+        }
+    }
+    return map;
+}
+/**
+ * Build the per-side line map for one path on the TRIAL-merge path. We have no
+ * working tree, so we synthesize git's combined diff from the merged tree: wrap
+ * it in a throwaway merge commit (two parents = ours, theirs) and ask
+ * `git diff-tree --cc` for the combined diff, then parse it. All local, all in
+ * the object DB. Returns undefined on any failure (→ fallback numbering).
+ */
+function trialMergeSideMap(gitRoot, trialCommit, filePath) {
+    try {
+        const cc = execFileSync("git", ["diff-tree", "--cc", "-r", `-U${SIDEMAP_CONTEXT}`, trialCommit, "--", filePath], { cwd: gitRoot, encoding: "utf-8", timeout: GIT_LOCAL_TIMEOUT,
+            stdio: ["pipe", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 }).toString();
+        const m = parseCombinedDiffSideMap(cc);
+        return m.size > 0 ? m : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
 /**
  * Detect conflict regions for the PR via an in-memory trial merge.
  *
@@ -1722,7 +2153,25 @@ export function extractConflicts(gitRoot, base, head, prSpec = { pullNumber: 0 }
     if (blankIdx === -1)
         blankIdx = lines.length;
     const conflictPaths = lines.slice(1, blankIdx).map(s => s.trim()).filter(Boolean);
+    // Wrap the merged tree in a throwaway 2-parent merge commit so we can ask git
+    // for a real combined diff (ours = parent1, theirs = parent2) and read the
+    // per-side line numbers straight out of it. Best-effort: if this fails the
+    // renderer simply falls back to merged-file numbering.
+    let trialCommit = null;
+    try {
+        trialCommit = execFileSync("git", ["commit-tree", tree, "-p", refs.baseRef, "-p", refs.headRef, "-m", "git-print trial merge"], { cwd: gitRoot, encoding: "utf-8", timeout: GIT_LOCAL_TIMEOUT,
+            stdio: ["pipe", "pipe", "pipe"], maxBuffer: 16 * 1024 * 1024 }).toString().trim();
+        if (!/^[0-9a-f]{7,64}$/.test(trialCommit))
+            trialCommit = null;
+    }
+    catch {
+        trialCommit = null;
+    }
     const results = [];
+    // Merge-base for BASE numbering (single best-effort base; multi/virtual bases
+    // simply yield no content match below → BASE left blank, never wrong).
+    const mbRes = gitExecSafe(["merge-base", refs.baseRef, refs.headRef], gitRoot);
+    const mergeBase = mbRes.ok && /^[0-9a-f]{7,64}$/.test(mbRes.stdout) ? mbRes.stdout : null;
     for (const filePath of conflictPaths) {
         // Size gate straight from the object DB — no disk read.
         const sz = gitExecSafe(["cat-file", "-s", `${tree}:${filePath}`], gitRoot);
@@ -1752,7 +2201,17 @@ export function extractConflicts(gitRoot, base, head, prSpec = { pullNumber: 0 }
             continue;
         }
         const regions = parseConflictMarkers(content);
-        results.push({ path: filePath, regions, oversized: false });
+        // Context ours/theirs from the combined diff; conflict-block + BASE numbers
+        // located structurally in the clean ref blobs (ours = base side of the
+        // markers, theirs = head side, base = merge-base). All local object reads.
+        const combined = trialCommit ? trialMergeSideMap(gitRoot, trialCommit, filePath) : undefined;
+        const blobs = {
+            ours: readBlobLines(gitRoot, `${refs.baseRef}:${filePath}`),
+            theirs: readBlobLines(gitRoot, `${refs.headRef}:${filePath}`),
+            base: mergeBase ? readBlobLines(gitRoot, `${mergeBase}:${filePath}`) : undefined,
+        };
+        const sideMap = buildSideLineMap(content, combined, blobs);
+        results.push({ path: filePath, regions, oversized: false, sideMap });
     }
     return results;
 }

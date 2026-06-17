@@ -34,5 +34,10 @@ export declare function addWorktree(alias: string, worktreeName: string, wtPath?
 export declare function remove(target: string): void;
 /** Resolve --repo [--worktree] into an absolute directory path. */
 export declare function resolve(alias: string, worktreeName?: string): string;
+/** Return all registered repos as {alias, path} pairs (top-level repos only). */
+export declare function getRepos(): {
+    alias: string;
+    path: string;
+}[];
 /** Print a human-readable list of all registered repos + worktrees. */
 export declare function list(): void;

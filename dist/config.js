@@ -279,6 +279,11 @@ export function resolve(alias, worktreeName) {
         throw new Error(`Repo "${alias}" not registered. Run: git-print add ${alias} <path>`);
     return path;
 }
+/** Return all registered repos as {alias, path} pairs (top-level repos only). */
+export function getRepos() {
+    const entries = read();
+    return allKVInSection(entries, "Repos").map(kv => ({ alias: kv.key, path: kv.value }));
+}
 /** Print a human-readable list of all registered repos + worktrees. */
 export function list() {
     const entries = read();

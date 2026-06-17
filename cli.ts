@@ -13,18 +13,19 @@
  * current working tree (which must be on the PR head branch).
  */
 
-import { execSync } from "node:child_process";
+import { execSync, execFileSync } from "node:child_process";
 import { mkdir, unlink, writeFile, readFile, chmod } from "node:fs/promises";
-import { existsSync, readFileSync, writeFileSync, chmodSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, writeFileSync, chmodSync, statSync, mkdirSync, unlinkSync } from "node:fs";
+import { join, dirname } from "node:path";
 import {
   fetchAllPRData, fetchPRMetadata, fetchAllPages, renderPR, renderReport,
-  resolveConflicts, extractConflicts, gitCommonDir,
+  resolveConflicts, extractConflicts, gitCommonDir, parseCombinedDiffSideMap,
+  buildSideLineMap, readBlobLines,
 } from "./pr-renderer.js";
-import type { PRRendererOptions, PRData, PRMetadata, ConflictFile } from "./pr-renderer.js";
+import type { PRRendererOptions, PRData, PRMetadata, ConflictFile, SideLineMap } from "./pr-renderer.js";
 import {
   addRepo, addWorktree, remove as removeConfig, list as listConfig,
-  resolve as resolveAlias, detectRepoRoot,
+  resolve as resolveAlias, detectRepoRoot, getRepos,
 } from "./config.js";
 
 // ─── Arg parsing ─────────────────────────────────────────────────────────────
@@ -514,9 +515,65 @@ interface UFile {
   path: string;
   notice: "oversized" | "nomarkers" | null;
   regions: URegion[];
+  /** result-line → {ours, theirs, base} per-side line numbers. Context from
+   *  git's combined diff; conflict-block + BASE numbers located structurally in
+   *  the clean blobs. Absent → renderer falls back to merged-file numbers. */
+  sideMap?: SideLineMap;
 }
 
 const CONFLICT_CONTEXT = 3;
+// Extra context requested from `git diff` when building the per-side line map,
+// so every displayed context line (≤ CONFLICT_CONTEXT) is covered by a hunk.
+const SIDEMAP_CONTEXT = 8;
+
+/** Human label for a conflict region's location, in real per-side line numbers
+ *  (read from the combined-diff side map): the ours span for an edit/delete, or
+ *  the theirs span for an incoming-only add. Falls back to the merged-file span
+ *  when no side map is available. */
+function regionRangeLabel(file: UFile, rg: URegion): string {
+  const sm = file.sideMap;
+  if (sm) {
+    const ours: number[] = [], theirs: number[] = [];
+    for (let n = rg.startLine; n <= rg.endLine; n++) {
+      const e = sm.get(n);
+      if (e?.ours != null) ours.push(e.ours);
+      if (e?.theirs != null) theirs.push(e.theirs);
+    }
+    if (ours.length) return `ours L${Math.min(...ours)}–${Math.max(...ours)}`;
+    if (theirs.length) return `theirs L${Math.min(...theirs)}–${Math.max(...theirs)}`;
+  }
+  return `lines ${rg.startLine}–${rg.endLine}`;
+}
+
+/** Build the per-side line map for one conflicted working-tree file. Local-only:
+ *  context ours/theirs come from git's combined diff (`git diff`), while each
+ *  conflict block (incl. BASE) is located structurally in its exact index-stage
+ *  blob — stage 1 = base, 2 = ours, 3 = theirs. Best-effort (undefined on
+ *  failure → renderer falls back to merged-file numbers). */
+function workingTreeSideMap(dir: string, relPath: string, content: string):
+  SideLineMap | undefined {
+  try {
+    let combined: Map<number, { ours: number | null; theirs: number | null }> | undefined;
+    try {
+      const cc = execFileSync(
+        "git", ["diff", `-U${SIDEMAP_CONTEXT}`, "--", relPath],
+        { cwd: dir, encoding: "utf-8", maxBuffer: 64 * 1024 * 1024,
+          stdio: ["pipe", "pipe", "pipe"] },
+      ).toString();
+      const m = parseCombinedDiffSideMap(cc);
+      combined = m.size > 0 ? m : undefined;
+    } catch { combined = undefined; }
+    const blobs = {
+      ours:   readBlobLines(dir, `:2:${relPath}`),
+      base:   readBlobLines(dir, `:1:${relPath}`),
+      theirs: readBlobLines(dir, `:3:${relPath}`),
+    };
+    const map = buildSideLineMap(content, combined, blobs);
+    return map.size > 0 ? map : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Normalizer A — build the unified model from the live working tree. Reads
@@ -554,7 +611,7 @@ function conflictFilesFromWorkingTree(dir: string, conflictPaths: string[]): UFi
           ctxAfter: lines.slice(rg.end + 1, ctxEnd),
         };
       });
-      files.push({ path: relPath, notice: null, regions });
+      files.push({ path: relPath, notice: null, regions, sideMap: workingTreeSideMap(dir, relPath, content) });
     } catch {
       files.push({ path: relPath, notice: "nomarkers", regions: [] });
     }
@@ -587,7 +644,7 @@ function conflictFilesFromExtract(
       ctxBefore: r.contextBefore.slice(-CONFLICT_CONTEXT),
       ctxAfter: r.contextAfter.slice(0, CONFLICT_CONTEXT),
     }));
-    return { path: cf.path, notice: null, regions };
+    return { path: cf.path, notice: null, regions, sideMap: cf.sideMap };
   });
 }
 
@@ -626,9 +683,11 @@ function composeConflictMarkdown(
   w();
   w(`**${files.length}** conflicting file${files.length !== 1 ? "s" : ""} · **${totalRegions}** conflict region${totalRegions !== 1 ? "s" : ""}`);
   w();
-  w(`> **OURS** = your branch (\`${oursName}\`) · **THEIRS** = incoming (\`${theirsName}\`) · **BASE** = common ancestor _(shown only with diff3 / zdiff3 conflict style)_`);
-  w(`>`);
-  w(`> Gutter numbers are the real file line numbers. \`-\` is ours, \`+\` is theirs.`);
+  w(`**OURS** = your branch (\`${oursName}\`)`);
+  w(`**THEIRS** = incoming (\`${theirsName}\`)`);
+  w(`**BASE** = common ancestor _(shown only with diff3 / zdiff3 conflict style)_`);
+  w();
+  w(`Gutter shows per-side real file line numbers — ours on \`-\`/context, theirs on \`+\`, base on the ancestor block; conflict markers are unnumbered.`);
   w();
   w("---");
 
@@ -653,30 +712,39 @@ function composeConflictMarkdown(
       else if (theirsCount === 0) cls = `🔴 Incoming deletes ${oursCount} line${oursCount !== 1 ? "s" : ""} that ours keeps.`;
       else                        cls = `⚡ Both sides edited this span${rg.ancestorLines !== null ? " (ancestor shown)" : ""}.`;
 
-      w(`### Conflict ${r + 1} of ${file.regions.length} · lines ${rg.startLine}–${rg.endLine}`);
+      w(`### Conflict ${r + 1} of ${file.regions.length} · ${regionRangeLabel(file, rg)}`);
       w();
       w(`> ${cls}`);
       w();
 
-      const maxLine = rg.endLine + rg.ctxAfter.length;
-      const width = String(maxLine).length;
-      const g = (n: number) => String(n).padStart(width);
+      const sideMap = file.sideMap;
+      const oursAt = (n: number): number | null => sideMap ? (sideMap.get(n)?.ours ?? null) : n;
+      const theirsAt = (n: number): number | null => sideMap ? (sideMap.get(n)?.theirs ?? null) : n;
+      const baseAt = (n: number): number | null => sideMap ? (sideMap.get(n)?.base ?? null) : null;
       const oursLabel = (rg.oursLabel === "HEAD" || rg.oursLabel === "") ? (currentBranch ?? oursName) : rg.oursLabel;
       const theirsLabel = rg.theirsLabel === "" ? theirsName : rg.theirsLabel;
 
+      // Per-side gutter: ours numbers on ours + context lines, theirs numbers on
+      // theirs lines, blank on every git marker and the BASE/ancestor block.
+      // `ln` walks the real result-file line, so it keys straight into sideMap.
+      const gutterRows: { num: number | null; text: string }[] = [];
       let ln = rg.startLine - rg.ctxBefore.length;
-      w("```diff");
-      for (const t of rg.ctxBefore) { out.push(`${g(ln)}   ${t}`.replace(/\s+$/, "")); ln++; }
-      out.push(`${g(ln)}  ${rule(`<<<<<<< OURS · ${oursLabel}`, "═")}`); ln++;
-      for (const t of rg.oursLines) { out.push(`${g(ln)} - ${t}`.replace(/\s+$/, "")); ln++; }
+      for (const t of rg.ctxBefore) { gutterRows.push({ num: oursAt(ln), text: `   ${t}` }); ln++; }
+      gutterRows.push({ num: null, text: `  ${rule(`<<<<<<< OURS · ${oursLabel}`, "═")}` }); ln++;
+      for (const t of rg.oursLines) { gutterRows.push({ num: oursAt(ln), text: ` - ${t}` }); ln++; }
       if (rg.ancestorLines !== null) {
-        out.push(`${g(ln)}  ${rule("||||||| BASE · common ancestor", "─")}`); ln++;
-        for (const t of rg.ancestorLines) { out.push(`${g(ln)}   ${t}`.replace(/\s+$/, "")); ln++; }
+        gutterRows.push({ num: null, text: `  ${rule("||||||| BASE · common ancestor", "─")}` }); ln++;
+        for (const t of rg.ancestorLines) { gutterRows.push({ num: baseAt(ln), text: `   ${t}` }); ln++; }
       }
-      out.push(`${g(ln)}  ${rule(`======= THEIRS · ${theirsLabel}`, "═")}`); ln++;
-      for (const t of rg.theirsLines) { out.push(`${g(ln)} + ${t}`.replace(/\s+$/, "")); ln++; }
-      out.push(`${g(ln)}  ${rule(">>>>>>> END", "═")}`); ln++;
-      for (const t of rg.ctxAfter) { out.push(`${g(ln)}   ${t}`.replace(/\s+$/, "")); ln++; }
+      gutterRows.push({ num: null, text: `  ${rule(`======= THEIRS · ${theirsLabel}`, "═")}` }); ln++;
+      for (const t of rg.theirsLines) { gutterRows.push({ num: theirsAt(ln), text: ` + ${t}` }); ln++; }
+      gutterRows.push({ num: null, text: `  ${rule(">>>>>>> END", "═")}` }); ln++;
+      for (const t of rg.ctxAfter) { gutterRows.push({ num: oursAt(ln), text: `   ${t}` }); ln++; }
+
+      const width = Math.max(1, ...gutterRows.map(r => r.num != null ? String(r.num).length : 0));
+      const g = (n: number | null) => (n != null ? String(n) : "").padStart(width);
+      w("```diff");
+      for (const row of gutterRows) out.push(`${g(row.num)}${row.text}`.replace(/\s+$/, ""));
       w("```");
       w();
     }
@@ -693,7 +761,7 @@ function composeConflictMarkdown(
     if (file.notice === "oversized")      w(`| \`${file.path}\` | ⚠ oversized | — |`);
     else if (file.notice === "nomarkers") w(`| \`${file.path}\` | delete/modify | — |`);
     else {
-      const spans = file.regions.map(rr => `L${rr.startLine}–${rr.endLine}`).join(", ");
+      const spans = file.regions.map(rr => regionRangeLabel(file, rr)).join(", ");
       w(`| \`${file.path}\` | ${file.regions.length} | ${spans} |`);
     }
   }
@@ -1011,28 +1079,8 @@ const isEntry = (() => {
   } catch { return true; }
 })();
 
-if (isEntry) {
-  const args = process.argv.slice(2);
-  const sub  = args[0];
-
-  if (sub === "add" || sub === "list" || sub === "remove") {
-    runSubcommand(args);
-  } else if (sub === "auto") {
-    runAuto().catch((e) => {
-      console.error(`git-print auto: ${e.message}`);
-      process.exit(0);
-    });
-  } else if (sub === "install") {
-    runInstall();
-  } else if (sub === "uninstall") {
-    runUninstall();
-  } else {
-    main().catch((e) => {
-      console.error(`Fatal: ${e.message}`);
-      process.exit(1);
-    });
-  }
-}
+// Entry dispatch lives at the END of this file (after all declarations) so that
+// install/uninstall/etc. don't hit a temporal-dead-zone on module-level consts.
 
 // ─── Auto subcommand ──────────────────────────────────────────────────────────
 
@@ -1117,59 +1165,299 @@ function addToGlobalGitignore(entry: string): void {
   console.log(`✓  Added ${entry} to ${ignorePath}`);
 }
 
-function runInstall(): void {
+// ─── CI-failure reporter workflow ────────────────────────────────────────────
+
+const CI_WORKFLOW_REL = ".github/workflows/git-print-ci-status.yml";
+const CI_WORKFLOW_MARKER = "# git-print:ci-status";
+
+// Written verbatim into each repo. GitHub Actions expressions use ${{ ... }} —
+// escaped here as \${{ so this JS template literal doesn't interpolate them.
+const CI_WORKFLOW_YAML = `name: Git-Print CI Status
+${CI_WORKFLOW_MARKER}
+#
+# Auto-installed by \`git-print install\`. When a watched CI workflow FAILS on a
+# pull request, this builds a CI-failure report (status, failure annotations +
+# extracted job logs, changed files, commits) and uploads it as the
+# "Git-Print-CI-Status" artifact.
+#
+#   * EDIT workflows: below to match the name: of YOUR CI workflow(s). Default "CI".
+#   * This file must exist on the repo's DEFAULT branch to take effect.
+#   * workflow_run is the only trigger that can observe GitHub-Actions CI failures.
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  actions: read
+
+jobs:
+  report:
+    if: \${{ github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.event == 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install git-print
+        run: npm install -g github:itstanner5216/Git-Print
+
+      - name: Resolve PR number
+        id: pr
+        env:
+          GH_TOKEN: \${{ github.token }}
+        run: |
+          PR=$(jq -r '.[0].number // empty' <<< '\${{ toJSON(github.event.workflow_run.pull_requests) }}')
+          if [ -z "$PR" ]; then
+            PR=$(gh api "repos/\${{ github.repository }}/commits/\${{ github.event.workflow_run.head_sha }}/pulls" --jq '.[0].number // empty' 2>/dev/null || true)
+          fi
+          echo "number=$PR" >> "$GITHUB_OUTPUT"
+          if [ -n "$PR" ]; then echo "Resolved PR #$PR"; else echo "No PR for this run — nothing to report."; fi
+
+      - name: Generate CI failure report
+        if: steps.pr.outputs.number != ''
+        env:
+          GITHUB_TOKEN: \${{ github.token }}
+        run: |
+          git-print ci-status --pr "\${{ steps.pr.outputs.number }}" --sha "\${{ github.event.workflow_run.head_sha }}" --out Git-Print-CI-Status.md
+
+      - name: Upload report artifact
+        if: steps.pr.outputs.number != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: Git-Print-CI-Status
+          path: Git-Print-CI-Status.md
+`;
+
+function repoIsGit(path: string): boolean {
+  try { execSync("git rev-parse --git-dir", { cwd: path, stdio: ["pipe", "pipe", "pipe"] }); return true; }
+  catch { return false; }
+}
+
+function repoHasGitHubRemote(path: string): boolean {
+  try {
+    const out = execSync("git remote -v", { cwd: path, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }) as string;
+    return /github\.com[:/]/.test(out);
+  } catch { return false; }
+}
+
+/**
+ * Write the CI-failure reporter workflow into every registered repo that is a
+ * git repo with a GitHub remote. Idempotent (overwrites our own file). Files are
+ * left UNTRACKED — the user commits + pushes to the default branch to activate.
+ */
+function writeCiWorkflows(dryRun = false): void {
+  const repos = getRepos();
+  if (repos.length === 0) {
+    console.log("   (no repos registered — run: git-print add <alias> <path>)");
+    return;
+  }
+  let wrote = 0, updated = 0, skipped = 0;
+  for (const { alias, path } of repos) {
+    const label = alias.padEnd(20);
+    if (!existsSync(path))          { console.log(`   ⫯ ${label} path missing — skipped`); skipped++; continue; }
+    if (!repoIsGit(path))           { console.log(`   ⫯ ${label} not a git repo — skipped`); skipped++; continue; }
+    if (!repoHasGitHubRemote(path)) { console.log(`   ⫯ ${label} no github.com remote — skipped`); skipped++; continue; }
+    const dest = join(path, CI_WORKFLOW_REL);
+    const existed = existsSync(dest);
+    if (existed) updated++; else wrote++;
+    if (dryRun) { console.log(`   ${existed ? "↻" : "✓"} ${label} ${dest}  (dry-run)`); continue; }
+    mkdirSync(dirname(dest), { recursive: true });
+    writeFileSync(dest, CI_WORKFLOW_YAML);
+    console.log(`   ${existed ? "↻ updated" : "✓ wrote  "} ${label} ${dest}`);
+  }
+  console.log(`\n   ${dryRun ? "[dry-run] " : ""}${wrote} written, ${updated} updated, ${skipped} skipped.`);
+  if (wrote + updated > 0 && !dryRun) {
+    console.log(`   ⚠ Files are UNTRACKED — commit + push to each repo's DEFAULT branch to activate.`);
+    console.log(`   ⚠ The workflow installs git-print from github:itstanner5216/Git-Print, so the`);
+    console.log(`     'ci-status' command must be on that repo's default branch first.`);
+  }
+}
+
+function installConflictHook(): void {
   const { major, minor } = getGitVersion();
   const hasConfigHooks = major > 2 || (major === 2 && minor >= 54);
-
   if (hasConfigHooks) {
     execSync(`git config --global hook.${HOOK_NAME}.event pre-push`, { stdio: "inherit" });
     execSync(`git config --global "hook.${HOOK_NAME}.command" "git-print auto"`, { stdio: "inherit" });
-    console.log(`✓  Installed (git ${major}.${minor} — config-based hook, global, no files written)`);
-    console.log(`   Runs git-print auto on every push across all repos.`);
-    console.log(`   Uninstall: git-print uninstall`);
+    console.log(`   ✓ git ${major}.${minor} config-based pre-push hook (global)`);
   } else {
     const gitRoot  = getGitRoot(process.cwd());
     const hookPath = join(gitCommonDir(gitRoot), "hooks", "pre-push");
-    // readFileSync, writeFileSync, chmodSync imported at top
     const marker   = "# git-print auto";
-
     if (existsSync(hookPath)) {
       const src = readFileSync(hookPath, "utf-8") as string;
-      if (src.includes(marker)) { console.log(`✓  Already installed in ${hookPath}`); return; }
+      if (src.includes(marker)) { console.log(`   ✓ already in ${hookPath}`); return; }
       writeFileSync(hookPath, `${src.trimEnd()}\n\n${marker}\ngit ls-files -u | grep -q . && git-print auto\n`);
-      console.log(`✓  Appended to existing pre-push hook: ${hookPath}`);
+      console.log(`   ✓ appended to ${hookPath}`);
     } else {
       writeFileSync(hookPath, `#!/bin/bash\n${marker}\ngit ls-files -u | grep -q . && git-print auto\nexit 0\n`);
       chmodSync(hookPath, 0o755);
-      console.log(`✓  Created pre-push hook: ${hookPath}`);
+      console.log(`   ✓ created ${hookPath}`);
     }
-    console.log(`   (git 2.54+ supports a cleaner global config-based hook)`);
-    console.log(`   Uninstall: git-print uninstall`);
   }
-
-  // Add .git-print/ to global gitignore so worktree output dirs are never tracked
-  addToGlobalGitignore(".git-print/");
 }
 
-function runUninstall(): void {
+function runInstall(opts: { dryRun?: boolean; ciOnly?: boolean } = {}): void {
+  const { dryRun = false, ciOnly = false } = opts;
+  console.log(dryRun ? "git-print install — DRY RUN (no changes written)\n" : "git-print install\n");
+
+  if (!ciOnly && !dryRun) {
+    console.log("Conflict reporter (global pre-push hook):");
+    installConflictHook();
+    addToGlobalGitignore(".git-print/");
+    console.log("");
+  }
+
+  console.log(`CI-failure reporter (${CI_WORKFLOW_REL}) → registered repos:`);
+  writeCiWorkflows(dryRun);
+  console.log(`\n   Uninstall: git-print uninstall`);
+}
+
+function removeCiWorkflows(): void {
+  let removed = 0;
+  for (const { alias, path } of getRepos()) {
+    const dest = join(path, CI_WORKFLOW_REL);
+    if (!existsSync(dest)) continue;
+    try {
+      const src = readFileSync(dest, "utf-8") as string;
+      if (src.includes(CI_WORKFLOW_MARKER)) {
+        unlinkSync(dest);
+        console.log(`   ✓ removed ${alias}: ${dest}`);
+        removed++;
+      }
+    } catch { /* ignore */ }
+  }
+  console.log(`   CI workflow: ${removed} removed.`);
+}
+
+function uninstallConflictHook(): void {
   const { major, minor } = getGitVersion();
   const hasConfigHooks = major > 2 || (major === 2 && minor >= 54);
-
   if (hasConfigHooks) {
     try {
       execSync(`git config --global --remove-section hook.${HOOK_NAME}`, { stdio: "pipe" });
-      console.log(`✓  Removed hook from ~/.gitconfig`);
-    } catch { console.log(`Nothing to remove — hook not found in ~/.gitconfig`); }
+      console.log(`   ✓ removed hook from ~/.gitconfig`);
+    } catch { console.log(`   (no hook in ~/.gitconfig)`); }
   } else {
     const gitRoot  = getGitRoot(process.cwd());
     const hookPath = join(gitCommonDir(gitRoot), "hooks", "pre-push");
-    if (!existsSync(hookPath)) { console.log(`Nothing to remove — no pre-push hook found`); return; }
-    // readFileSync, writeFileSync imported at top
+    if (!existsSync(hookPath)) { console.log(`   (no pre-push hook found)`); return; }
     const filtered = (readFileSync(hookPath, "utf-8") as string)
       .split("\n")
       .filter((l: string) => !l.includes("git-print auto") && !l.includes("# git-print auto"))
       .join("\n");
     writeFileSync(hookPath, filtered);
-    console.log(`✓  Removed git-print lines from ${hookPath}`);
+    console.log(`   ✓ removed git-print lines from ${hookPath}`);
+  }
+}
+
+function runUninstall(): void {
+  console.log("git-print uninstall\n");
+  console.log("Conflict reporter (pre-push hook):");
+  uninstallConflictHook();
+  console.log(`\nCI-failure reporter (${CI_WORKFLOW_REL}):`);
+  removeCiWorkflows();
+}
+
+// ─── ci-status subcommand ───────────────────────────────────────────────────
+//
+// Designed to run *inside* a GitHub Actions job that fires only on CI failure
+// (see the workflow written by `git-print install`). It renders the same report
+// `renderReport` produces — CI status (failure annotations + extracted job
+// logs), changed files, commits — to an explicit --out path so the job can
+// upload it as an artifact.
+// No local state, no polling, no daemon: the failing run builds the report
+// server-side and you pull it from the run's artifacts.
+async function runCiStatus(args: string[]): Promise<void> {
+  let prNumber: number | null = null;
+  let sha: string | null = null;
+  let out = "Git-Print-CI-Status.md";
+  let repoArg: string | null = null;
+  let dir = process.cwd();
+  let token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_PAT || null;
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--pr" && i + 1 < args.length) prNumber = parseInt(args[++i], 10);
+    else if (a === "--sha" && i + 1 < args.length) sha = args[++i];
+    else if ((a === "--out" || a === "-o") && i + 1 < args.length) out = args[++i];
+    else if (a === "--repo" && i + 1 < args.length) repoArg = args[++i];
+    else if (a === "--dir" && i + 1 < args.length) dir = args[++i];
+    else if (a === "--token" && i + 1 < args.length) token = args[++i];
+  }
+
+  if (prNumber === null || Number.isNaN(prNumber)) {
+    console.error("git-print ci-status: --pr <number> is required");
+    process.exit(1);
+  }
+  if (!token) {
+    console.error("git-print ci-status: no token (set GITHUB_TOKEN / GH_TOKEN / GITHUB_PAT or --token).");
+    process.exit(1);
+  }
+
+  // Resolve owner/repo: --repo > $GITHUB_REPOSITORY (set by Actions) > git remote.
+  let owner: string, repo: string;
+  if (repoArg && repoArg.includes("/")) {
+    [owner, repo] = repoArg.split("/", 2);
+  } else if (process.env.GITHUB_REPOSITORY && process.env.GITHUB_REPOSITORY.includes("/")) {
+    [owner, repo] = process.env.GITHUB_REPOSITORY.split("/", 2);
+  } else {
+    ({ owner, repo } = getGitHubRemote(getGitRoot(dir)));
+  }
+
+  console.error(`Git-Print CI status — ${owner}/${repo} PR #${prNumber}${sha ? ` @ ${sha.slice(0, 7)}` : ""}`);
+
+  const data = await fetchAllPRData(owner, repo, prNumber, token, token);
+  // Pin the check-runs lookup to the exact pushed commit when provided, so the
+  // report reflects the run that failed even if the PR head advanced since.
+  if (sha) data.pr.head.sha = sha;
+
+  const parent = dirname(out);
+  if (parent && parent !== ".") await mkdir(parent, { recursive: true });
+
+  await renderReport(data, {
+    owner, repo,
+    pullNumber: prNumber,
+    token,
+    graphqlToken: token,
+    outputPath: out,
+    includeResolvedThreads: true,
+    fetchCheckAnnotations: true,
+  });
+  console.error(`✓  Wrote CI status report → ${out}`);
+}
+
+
+// ─── Entry dispatch ────────────────────────────────────────────────────────────
+// Placed last so every function + module-level const above is initialized before
+// any subcommand runs (avoids temporal-dead-zone ReferenceErrors).
+
+if (isEntry) {
+  const args = process.argv.slice(2);
+  const sub  = args[0];
+
+  if (sub === "add" || sub === "list" || sub === "remove") {
+    runSubcommand(args);
+  } else if (sub === "auto") {
+    runAuto().catch((e) => {
+      console.error(`git-print auto: ${e.message}`);
+      process.exit(0);
+    });
+  } else if (sub === "install") {
+    runInstall({ dryRun: args.includes("--dry-run"), ciOnly: args.includes("--ci-only") });
+  } else if (sub === "uninstall") {
+    runUninstall();
+  } else if (sub === "ci-status") {
+    runCiStatus(args.slice(1)).catch((e) => {
+      console.error(`git-print ci-status: ${e.message}`);
+      process.exit(1);
+    });
+  } else {
+    main().catch((e) => {
+      console.error(`Fatal: ${e.message}`);
+      process.exit(1);
+    });
   }
 }

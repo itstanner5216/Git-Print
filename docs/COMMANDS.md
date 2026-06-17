@@ -8,13 +8,13 @@
 
 - [ ] **Install dependencies**
   ```bash
-  pnpm install
+  npm install
   ```
 
 - [ ] **Build the CLI**
   ```bash
-  pnpm build
-  # compiles TypeScript → dist/
+  npm run build
+  # compiles TypeScript (src/) → dist/
   ```
 
 - [ ] **Link the binary globally** *(optional, one-time)*
@@ -28,6 +28,9 @@
   export GITHUB_TOKEN=ghp_yourTokenHere
   # also works: GH_TOKEN or GITHUB_PAT
   ```
+  Or drop a `.env` in the repo root with `GITHUB_TOKEN` (or `GH_TOKEN` /
+  `GITHUB_PAT`). git-print loads it automatically; real environment variables
+  take precedence, and the file is only read, never modified.
 
 ---
 
@@ -106,6 +109,59 @@
 
 ---
 
+## Automation & CI
+
+> Subcommands for wiring git-print into your repos and CI. These don't take a PR
+> number — they operate on registered repos or the current repo.
+
+- [ ] **Register a repo & install hooks + CI reporter**
+  ```bash
+  git-print install
+  # • registers the current repo
+  # • installs a post-merge "auto" conflict hook
+  # • writes a CI-failure reporter workflow into every registered GitHub repo:
+  #     .github/workflows/git-print-ci-status.yml
+  ```
+
+- [ ] **(Re)write only the CI reporter workflow** *(skip hooks/gitignore)*
+  ```bash
+  git-print install --ci-only
+  ```
+
+- [ ] **Preview an install without writing anything**
+  ```bash
+  git-print install --dry-run
+  # combine: git-print install --ci-only --dry-run
+  ```
+
+- [ ] **Remove the hook + CI reporter workflow**
+  ```bash
+  git-print uninstall
+  ```
+
+- [ ] **Auto-detect local merge conflicts** *(invoked by the git hook)*
+  ```bash
+  git-print auto
+  # silent when clean; on conflicts writes a conflicts report (and links the PR
+  # if a GitHub token is available)
+  ```
+
+- [ ] **Render a CI-failure report** *(run by the reporter workflow)*
+  ```bash
+  git-print ci-status --pr 42 --out report.md
+  # options:
+  #   --pr <n>           PR number                          (required)
+  #   --sha <sha>        pin checks to the commit that failed
+  #   --out, -o <file>   output path         (default: Git-Print-CI-Status.md)
+  #   --repo owner/repo  override repo detection (else $GITHUB_REPOSITORY / remote)
+  #   --token <token>    GitHub token        (else env / repo .env)
+  ```
+  > The reporter workflow runs this on a failed CI run and uploads the result as
+  > a build artifact — no daemon, no polling. The report includes CI status,
+  > failure annotations, extracted job-log error output, changed files, and commits.
+
+---
+
 ## Output Files
 
 | File | What's inside |
@@ -123,8 +179,8 @@ Output is always written to: `.git/Git-Print/PR-{n}-{type}.md`
 
 - [ ] **Compile TypeScript**
   ```bash
-  pnpm build
-  # runs: tsc
+  npm run build
+  # runs: tsc  (src/ → dist/)
   ```
 
 - [ ] **Run the compiled CLI directly** *(without global link)*
@@ -136,21 +192,22 @@ Output is always written to: `.git/Git-Print/PR-{n}-{type}.md`
 
 ## Tests
 
+> Tests live in `tests/`. The `.mjs` tests import the compiled build, so run
+> `npm run build` first.
+
 - [ ] **Unit tests** — comment body cleaning logic
   ```bash
-  node test-clean-body.mjs
+  npm run build && node tests/test-clean-body.mjs
   ```
 
-- [ ] **Fixture test** — full PR renderer output contract *(requires a build first)*
+- [ ] **Fixture test** — full PR renderer output contract
   ```bash
-  pnpm build && node test-render-fixture.mjs
+  npm run build && node tests/test-render-fixture.mjs
   ```
 
 - [ ] **Integration tests** — conflict detection & resolution *(8 scenarios)*
   ```bash
-  # compile then run
-  npx tsc test-conflicts.ts --outDir dist-test --module Node16 --moduleResolution Node16 --target ES2022 --esModuleInterop
-  node dist-test/test-conflicts.js
+  npx tsx tests/test-conflicts.ts
   ```
 
 ---
@@ -163,6 +220,11 @@ Git-Print looks for your GitHub token in this order:
 2. `$GITHUB_TOKEN` env var
 3. `$GH_TOKEN` env var
 4. `$GITHUB_PAT` env var
+5. The same keys in a `.env` file at the repo root (and the current directory)
+
+The `.env` file is only read when the env vars above are unset — real
+environment variables always win. `export KEY=value` lines are supported, and
+the file is never modified.
 
 ---
 

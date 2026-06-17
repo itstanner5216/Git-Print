@@ -18,6 +18,58 @@ import { existsSync, readFileSync, writeFileSync, chmodSync, statSync, mkdirSync
 import { join, dirname } from "node:path";
 import { fetchAllPRData, fetchPRMetadata, fetchAllPages, renderPR, renderReport, resolveConflicts, extractConflicts, gitCommonDir, parseCombinedDiffSideMap, buildSideLineMap, readBlobLines, } from "./pr-renderer.js";
 import { addRepo, addWorktree, remove as removeConfig, list as listConfig, resolve as resolveAlias, getRepos, } from "./config.js";
+// ─── Repo .env loading ───────────────────────────────────────────────────────
+/**
+ * Load credentials (and any other vars) from the repository's `.env` file.
+ *
+ * Reads `<dir>/.env` and the git repository root's `.env`, parsing simple
+ * `KEY=value` / `export KEY=value` lines. Only fills variables that are NOT
+ * already set in the real environment, so an explicit GITHUB_TOKEN or a
+ * CI-provided token always wins. This NEVER writes to or modifies the file.
+ */
+function loadRepoEnv(startDir) {
+    const candidates = [];
+    const add = (p) => { if (p && !candidates.includes(p))
+        candidates.push(p); };
+    try {
+        add(join(startDir, ".env"));
+    }
+    catch { /* ignore */ }
+    try {
+        const top = execSync("git rev-parse --show-toplevel", {
+            cwd: startDir, encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"],
+        }).trim();
+        if (top)
+            add(join(top, ".env"));
+    }
+    catch { /* not a git repo — fine */ }
+    for (const file of candidates) {
+        let text;
+        try {
+            if (!existsSync(file))
+                continue;
+            text = readFileSync(file, "utf-8");
+        }
+        catch {
+            continue;
+        }
+        for (const raw of text.split(/\r?\n/)) {
+            const line = raw.trim();
+            if (!line || line.startsWith("#"))
+                continue;
+            const m = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+            if (!m)
+                continue;
+            const key = m[1];
+            let val = m[2].trim();
+            if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+                val = val.slice(1, -1);
+            }
+            if (process.env[key] === undefined)
+                process.env[key] = val;
+        }
+    }
+}
 function parseArgs() {
     const args = process.argv.slice(2);
     let prNumber = null;
@@ -94,7 +146,9 @@ function parseArgs() {
             process.exit(1);
         }
     }
-    // Resolve token: --token > $GITHUB_TOKEN > $GH_TOKEN > $GITHUB_PAT
+    // Load the repo's .env (fills missing env vars only; never overwrites real env)
+    loadRepoEnv(dir);
+    // Resolve token: --token > $GITHUB_TOKEN > $GH_TOKEN > $GITHUB_PAT > repo .env
     if (!token) {
         token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_PAT || null;
     }
@@ -122,7 +176,8 @@ PR GENERATION
 
 OPTIONS
   --token <token>       GitHub personal access token
-                        (default: \$GITHUB_TOKEN, \$GH_TOKEN, or \$GITHUB_PAT)
+                        (default: \$GITHUB_TOKEN, \$GH_TOKEN, \$GITHUB_PAT,
+                         or one of those keys in <repo>/.env)
   --dir <path>          Directory to detect git repo from (default: cwd)
   --repo <alias>        Use a registered repo alias instead of --dir
   --worktree <name>     Use a named worktree within --repo
@@ -1001,6 +1056,7 @@ async function runAuto() {
         console.error(`   • ${f}`);
     const gitRoot = getGitRoot(dir);
     const branch = getCurrentBranch(gitRoot);
+    loadRepoEnv(gitRoot); // pick up GITHUB_TOKEN/PAT from the repo's .env if present
     const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_PAT || null;
     let remote = null;
     remote = tryGetGitHubRemote(gitRoot);
@@ -1301,7 +1357,7 @@ async function runCiStatus(args) {
     let out = "Git-Print-CI-Status.md";
     let repoArg = null;
     let dir = process.cwd();
-    let token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_PAT || null;
+    let token = null;
     for (let i = 0; i < args.length; i++) {
         const a = args[i];
         if (a === "--pr" && i + 1 < args.length)
@@ -1320,6 +1376,11 @@ async function runCiStatus(args) {
     if (prNumber === null || Number.isNaN(prNumber)) {
         console.error("git-print ci-status: --pr <number> is required");
         process.exit(1);
+    }
+    // Fall back to env / the repo's .env (CI sets GH_TOKEN; locally read <repo>/.env)
+    if (!token) {
+        loadRepoEnv(dir);
+        token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_PAT || null;
     }
     if (!token) {
         console.error("git-print ci-status: no token (set GITHUB_TOKEN / GH_TOKEN / GITHUB_PAT or --token).");

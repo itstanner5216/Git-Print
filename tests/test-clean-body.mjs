@@ -13,7 +13,7 @@
  * Run:  node test-clean-body.mjs   (after `pnpm build`)
  */
 
-import { cleanCommentBody } from "./dist/pr-renderer.js";
+import { cleanCommentBody } from "../dist/pr-renderer.js";
 
 let pass = 0;
 const failures = [];

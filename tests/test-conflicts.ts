@@ -18,7 +18,7 @@ import {
   validateInWorktree,
   applyResolutions,
   resolveConflicts,
-} from "./pr-renderer.js";
+} from "../src/pr-renderer.js";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 

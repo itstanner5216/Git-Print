@@ -19,7 +19,7 @@
  * Run:  node test-render-fixture.mjs   (after `pnpm build`)
  */
 
-import { renderPR } from "./dist/pr-renderer.js";
+import { renderPR } from "../dist/pr-renderer.js";
 import { readFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";

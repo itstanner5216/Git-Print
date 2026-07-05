@@ -256,6 +256,15 @@ export async function fetchAllPRData(owner, repo, pullNumber, token, graphqlToke
     }
     const unifiedChecks = mergeChecksAndStatuses(checkRuns, statuses);
     console.error(`Fetched: ${commits.length} commits, ${reviews.length} reviews, ${reviewComments.length} review comments, ${issueComments.length} issue comments, ${files.length} files, ${unifiedChecks.length} checks`);
+    // Recover Copilot/bot "suggested change" changesets the REST/GraphQL API never
+    // carries (github/github-mcp-server#2235) from the PR web page + its deferred
+    // resolved/outdated thread fragments. Best-effort: a failure here must never
+    // break the normal render, and it degrades silently to today's behaviour.
+    try {
+        const pageUrl = pr.html_url || `https://github.com/${owner}/${repo}/pull/${pullNumber}`;
+        await attachAutomatedSuggestions(pageUrl, reviewComments);
+    }
+    catch { /* never break the render over suggestion recovery */ }
     return {
         pr,
         commits,
@@ -491,6 +500,172 @@ function renderNumberedRows(rows) {
         const gutter = (num != null ? String(num) : "").padStart(width);
         return `${gutter} ${r.marker} ${r.content}`.trimEnd();
     });
+}
+// ─── Automated (Copilot/bot) suggestion recovery ─────────────────────────────
+/** Unescape the HTML entities GitHub uses inside a react-partial embeddedData
+ *  <script> payload so the JSON parses. Covers both decimal (`&#39;`, zero-padded
+ *  `&#039;`) and hex (`&#x27;`) apostrophes plus `&apos;`; `&amp;` is decoded LAST
+ *  so a double-escaped entity like `&amp;quot;` restores to `&quot;`, not `"`. */
+function htmlUnescape(s) {
+    return s
+        .replace(/&quot;/g, '"')
+        .replace(/&#x27;/gi, "'")
+        .replace(/&#0*39;/g, "'")
+        .replace(/&apos;/g, "'")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&amp;/g, "&");
+}
+/** Recursively walk a parsed embeddedData payload for every object that carries
+ *  an `automatedComment`, reading `automatedComment.suggestion.diffEntries` and
+ *  keying it by the comment's `databaseId` (== the REST comment.id). Searching
+ *  recursively — rather than assuming a fixed `props.comment.…` path — keeps the
+ *  recovery robust to the page's nesting changing. First writer wins so the
+ *  page's copy isn't clobbered by a later duplicate. */
+function collectAutomatedSuggestions(node, into) {
+    if (!node || typeof node !== "object")
+        return;
+    if (Array.isArray(node)) {
+        for (const item of node)
+            collectAutomatedSuggestions(item, into);
+        return;
+    }
+    if (node.automatedComment && typeof node.automatedComment === "object") {
+        const id = node.databaseId;
+        const entries = node.automatedComment?.suggestion?.diffEntries;
+        if (typeof id === "number" && Array.isArray(entries) && entries.length > 0 && !into.has(id)) {
+            into.set(id, entries);
+        }
+    }
+    for (const key of Object.keys(node))
+        collectAutomatedSuggestions(node[key], into);
+}
+/** Find every `react-partial.embeddedData` <script> in a page/fragment, JSON.parse
+ *  each (falling back to an html-unescape only if the raw parse fails, so an
+ *  already-plain payload is never corrupted), and collect its automated suggestion
+ *  changesets. A single unparseable payload is skipped, never fatal. */
+function scanEmbeddedData(html, into) {
+    const re = /<script[^>]*data-target="react-partial\.embeddedData"[^>]*>([\s\S]*?)<\/script>/g;
+    let m;
+    while ((m = re.exec(html)) !== null) {
+        let parsed;
+        try {
+            parsed = JSON.parse(m[1]);
+        }
+        catch {
+            try {
+                parsed = JSON.parse(htmlUnescape(m[1]));
+            }
+            catch {
+                continue; // one bad payload doesn't sink the rest
+            }
+        }
+        collectAutomatedSuggestions(parsed, into);
+    }
+}
+/** Plain GET of a github.com HTML page/fragment. NO Authorization header is ever
+ *  sent — a PAT does not authenticate github.com HTML and must never leak there.
+ *  Returns the body text, or null on any network/non-OK failure. */
+async function fetchGithubHtml(url) {
+    try {
+        const res = await fetch(url, { headers: { "User-Agent": "git-print", Accept: "text/html" } });
+        if (!res.ok)
+            return null;
+        return await res.text();
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * Copilot / bot code-review "suggested change" changesets are not carried by any
+ * REST or GraphQL field (github/github-mcp-server#2235): git-print's API-only
+ * fetch silently drops every one. The PR *web page* inlines each changeset as
+ * JSON inside a `react-partial.embeddedData` <script>, at
+ * `props.comment.automatedComment.suggestion.diffEntries`. Resolved / outdated
+ * (collapsed) threads are NOT server-rendered into the page — their changesets
+ * live behind `data-deferred-content-url="/…/threads/{id}"` fragments that must
+ * be fetched separately.
+ *
+ * This recovers BOTH: fetch the page, recursively collect every
+ * `automatedComment.suggestion.diffEntries` keyed by the comment's `databaseId`,
+ * then fetch each deferred `/threads/…` fragment and repeat. Each recovered
+ * changeset is attached to the matching review comment (`comment.id` ===
+ * page `databaseId`) as `automated_suggestions`, so writeThreadMd can render it
+ * exactly like a body-borne ```suggestion changeset — resolved ones landing in
+ * the existing "## Resolved" section since those threads already route there.
+ *
+ * Best-effort by design: NO Authorization header is sent to github.com, and any
+ * fetch/parse failure attaches nothing and leaves today's render untouched.
+ */
+export async function attachAutomatedSuggestions(prHtmlUrl, reviewComments) {
+    if (!prHtmlUrl || reviewComments.length === 0)
+        return;
+    const page = await fetchGithubHtml(prHtmlUrl);
+    if (page === null)
+        return;
+    const recovered = new Map();
+    scanEmbeddedData(page, recovered);
+    // Deferred/resolved threads: their changesets aren't in the page — fetch each
+    // /threads/{id} fragment (in parallel) and scan it the same way. This is what
+    // recovers the resolved/outdated Copilot suggestions the page-scan alone misses.
+    const deferred = new Set();
+    for (const dm of page.matchAll(/data-deferred-content-url="([^"]*)"/g)) {
+        const raw = htmlUnescape(dm[1]);
+        if (raw.includes("/threads/")) {
+            deferred.add(raw.startsWith("http") ? raw : `https://github.com${raw}`);
+        }
+    }
+    const fragments = await Promise.all([...deferred].map((url) => fetchGithubHtml(url)));
+    for (const frag of fragments) {
+        if (frag !== null)
+            scanEmbeddedData(frag, recovered);
+    }
+    if (recovered.size === 0)
+        return;
+    const byId = new Map(reviewComments.map((c) => [c.id, c]));
+    let attached = 0;
+    for (const [id, entries] of recovered) {
+        const target = byId.get(id);
+        if (target) {
+            target.automated_suggestions = entries;
+            attached++;
+        }
+    }
+    if (attached > 0) {
+        console.error(`Fetched: ${attached} automated suggested changeset(s) from the PR page`);
+    }
+}
+/**
+ * Render the changesets recovered by attachAutomatedSuggestions through the SAME
+ * numbered gutter as body-borne ```suggestion blocks (renderNumberedRows). Each
+ * diffEntries[] row already carries its old/new line numbers (`left`/`right`);
+ * HUNK header rows are dropped and CONTEXT/DELETION/ADDITION map to ` `/`-`/`+`
+ * — the "Suggested changeset N" caption labels the block. Returns one
+ * {path, lines} per changeset, ready to drop inside a ```diff fence.
+ */
+function automatedSuggestionDiffBlocks(comment) {
+    const out = [];
+    const entries = comment?.automated_suggestions;
+    if (!Array.isArray(entries))
+        return out;
+    for (const entry of entries) {
+        const rows = [];
+        for (const l of entry?.diffLines || []) {
+            if (l?.type === "HUNK")
+                continue;
+            const marker = l?.type === "DELETION" ? "-" : l?.type === "ADDITION" ? "+" : " ";
+            rows.push({
+                oldNum: typeof l?.left === "number" ? l.left : null,
+                newNum: typeof l?.right === "number" ? l.right : null,
+                marker,
+                content: l?.text ?? "",
+            });
+        }
+        if (rows.length > 0)
+            out.push({ path: entry?.path ?? null, lines: renderNumberedRows(rows) });
+    }
+    return out;
 }
 /**
  * Lines ready to drop inside a ```diff fence: the hunk rows GitHub anchors the
@@ -1059,13 +1234,27 @@ export async function renderPR(data, options) {
             blank();
         }
         let changesetNum = 1;
-        for (const block of suggestionDiffBlocks(root.body || "", root.diff_hunk || "", sl, el)) {
+        const rootBlocks = suggestionDiffBlocks(root.body || "", root.diff_hunk || "", sl, el);
+        for (const block of rootBlocks) {
             w(`**Suggested changeset ${changesetNum++}:** \`${filePath}\``);
             w("```diff");
             for (const l of block)
                 w(l);
             w("```");
             blank();
+        }
+        // Copilot/bot changesets recovered from the PR page (their prose-only bodies
+        // carry no ```suggestion fence). Skipped when a body suggestion already
+        // rendered, so one comment never shows the same changeset twice.
+        if (rootBlocks.length === 0) {
+            for (const { path, lines } of automatedSuggestionDiffBlocks(root)) {
+                w(`**Suggested changeset ${changesetNum++}:** \`${path ?? filePath}\``);
+                w("```diff");
+                for (const l of lines)
+                    w(l);
+                w("```");
+                blank();
+            }
         }
         for (const reply of thread.replies) {
             const rSeverity = extractSeverity(proseOnly(reply.body || ""));
@@ -1080,13 +1269,24 @@ export async function renderPR(data, options) {
             const rsl = reply.start_line ?? reply.original_start_line ?? sl;
             const rel = reply.line ?? reply.original_line ?? el;
             let rChangesetNum = 1;
-            for (const block of suggestionDiffBlocks(reply.body || "", reply.diff_hunk || root.diff_hunk || "", rsl, rel)) {
+            const replyBlocks = suggestionDiffBlocks(reply.body || "", reply.diff_hunk || root.diff_hunk || "", rsl, rel);
+            for (const block of replyBlocks) {
                 w(`**Suggested changeset ${rChangesetNum++}:** \`${reply.path || filePath}\``);
                 w("```diff");
                 for (const l of block)
                     w(l);
                 w("```");
                 blank();
+            }
+            if (replyBlocks.length === 0) {
+                for (const { path, lines } of automatedSuggestionDiffBlocks(reply)) {
+                    w(`**Suggested changeset ${rChangesetNum++}:** \`${path ?? reply.path ?? filePath}\``);
+                    w("```diff");
+                    for (const l of lines)
+                        w(l);
+                    w("```");
+                    blank();
+                }
             }
         }
     };

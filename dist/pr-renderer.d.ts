@@ -204,6 +204,28 @@ export declare function fetchPRMetadata(owner: string, repo: string, pullNumber:
  */
 export declare function fetchAllPRData(owner: string, repo: string, pullNumber: number, token: string, graphqlToken?: string): Promise<PRData>;
 /**
+ * Copilot / bot code-review "suggested change" changesets are not carried by any
+ * REST or GraphQL field (github/github-mcp-server#2235): git-print's API-only
+ * fetch silently drops every one. The PR *web page* inlines each changeset as
+ * JSON inside a `react-partial.embeddedData` <script>, at
+ * `props.comment.automatedComment.suggestion.diffEntries`. Resolved / outdated
+ * (collapsed) threads are NOT server-rendered into the page — their changesets
+ * live behind `data-deferred-content-url="/…/threads/{id}"` fragments that must
+ * be fetched separately.
+ *
+ * This recovers BOTH: fetch the page, recursively collect every
+ * `automatedComment.suggestion.diffEntries` keyed by the comment's `databaseId`,
+ * then fetch each deferred `/threads/…` fragment and repeat. Each recovered
+ * changeset is attached to the matching review comment (`comment.id` ===
+ * page `databaseId`) as `automated_suggestions`, so writeThreadMd can render it
+ * exactly like a body-borne ```suggestion changeset — resolved ones landing in
+ * the existing "## Resolved" section since those threads already route there.
+ *
+ * Best-effort by design: NO Authorization header is sent to github.com, and any
+ * fetch/parse failure attaches nothing and leaves today's render untouched.
+ */
+export declare function attachAutomatedSuggestions(prHtmlUrl: string | undefined, reviewComments: any[]): Promise<void>;
+/**
  * Strip the promotional / UI cruft bots inject into comment bodies so the
  * printout reads like clean prose: HTML comments, badge/mascot images,
  * social-share link lists, and CodeRabbit's "Tips"/"Share" <details> footers.

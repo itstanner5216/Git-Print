@@ -781,16 +781,6 @@ function buildCards(issueComments, reviews, reviewComments, resolvedMap, include
     for (const c of issueComments) {
         cards.push({ kind: "issue_comment", timestamp: c.created_at, data: c });
     }
-    // Review summary "events" — only when the review carries a body or a verdict.
-    // A plain COMMENTED review with no body contributes only its inline threads,
-    // so we don't emit an empty event card for it.
-    for (const r of reviews) {
-        const state = String(r.state || "").toUpperCase();
-        const hasVerdict = state === "CHANGES_REQUESTED" || state === "APPROVED" || state === "DISMISSED";
-        if ((r.body && r.body.trim()) || hasVerdict) {
-            cards.push({ kind: "review_event", timestamp: r.submitted_at || r.created_at, data: r });
-        }
-    }
     // Inline review threads — group each root comment with its replies.
     const threadRoots = new Map();
     const threadReplies = new Map();
@@ -807,6 +797,14 @@ function buildCards(issueComments, reviews, reviewComments, resolvedMap, include
             threadReplies.get(rootId).push(rc);
         }
     }
+    // On the PR page, a review = ONE timeline card: the summary body (if any)
+    // followed by every inline comment submitted with it. The API links them
+    // via comment.pull_request_review_id — group threads under their review so
+    // the render never splits one review into multiple "comments" (or orphans
+    // the summary from its inline comment).
+    const reviewIds = new Set(reviews.map((r) => r.id));
+    const threadsByReview = new Map();
+    const orphanThreads = [];
     for (const [rootId, root] of threadRoots) {
         const replies = (threadReplies.get(rootId) || [])
             .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
@@ -816,14 +814,39 @@ function buildCards(issueComments, reviews, reviewComments, resolvedMap, include
             isResolved = resolvedMap[root.id] ?? null;
         if (!includeResolved && isResolved === true)
             continue;
+        const group = { rootComment: root, replies, isOutdated, isResolved };
+        const reviewId = root.pull_request_review_id;
+        if (typeof reviewId === "number" && reviewIds.has(reviewId)) {
+            if (!threadsByReview.has(reviewId))
+                threadsByReview.set(reviewId, []);
+            threadsByReview.get(reviewId).push(group);
+        }
+        else {
+            orphanThreads.push(group);
+        }
+    }
+    // Review cards — emitted when the review carries a body, a verdict, or any
+    // inline threads (an empty COMMENTED review with no threads contributes
+    // nothing and gets no card).
+    for (const r of reviews) {
+        const state = String(r.state || "").toUpperCase();
+        const hasVerdict = state === "CHANGES_REQUESTED" || state === "APPROVED" || state === "DISMISSED";
+        const threads = threadsByReview.get(r.id) || [];
+        if ((r.body && r.body.trim()) || hasVerdict || threads.length > 0) {
+            cards.push({ kind: "review_event", timestamp: r.submitted_at || r.created_at, data: r, threads });
+        }
+    }
+    // Threads whose parent review isn't in the reviews list (defensive) still
+    // render as standalone cards rather than being dropped.
+    for (const group of orphanThreads) {
         cards.push({
             kind: "inline_thread",
-            timestamp: root.created_at,
-            thread: { rootComment: root, replies, isOutdated, isResolved },
+            timestamp: group.rootComment.created_at,
+            thread: group,
         });
     }
-    // Scroll order is chronological. On ties, a review event sorts before the
-    // inline threads submitted with it (they share a timestamp).
+    // Scroll order is chronological. On ties, a review event sorts before any
+    // standalone thread that shares its timestamp.
     const rank = (c) => (c.kind === "review_event" ? 0 : 1);
     cards.sort((a, b) => {
         const ta = new Date(a.timestamp).getTime();
@@ -933,10 +956,278 @@ function filterProseLines(s, keep) {
         .map((part, i) => i % 2 === 1 ? part : part.split("\n").filter(keep).join("\n"))
         .join("");
 }
+// <details> summaries that are bot process/promo furniture — the whole block
+// is dropped. Everything NOT matched here is review substance (qodo findings
+// with their diffs, CodeRabbit nitpicks / proposed fixes / committable
+// suggestions) and is UNWRAPPED instead: collapsed-but-present on the PR page
+// is still information, and dropping it loses real diffs (the #23 class).
+// Matched against the summary text lowercased with leading emoji stripped.
+const DETAILS_FURNITURE = [
+    /^walkthrough$/, /^share$/, /^tips$/, /finishing touches/,
+    /^generate unit tests/, /^generate docstrings/,
+    /pre-merge checks/, /^passed checks/, /^action performed/, /^context used/,
+    /prompt for all review comments/, /^prompt for ai agents/, /^autofix/,
+    /^review info/, /^run configuration/, /^commits\b/,
+    /^files selected for processing/, /^files skipped/, /^files not reviewed/,
+    /^show a summary per file/, /^analysis chain/, /^tools$/,
+    /^issues\b.*issues\s*$/, /^metrics\b.*(complexity|duplication)/,
+    /about codex/, /reply\s+"?\s*fix it for me/,
+];
+/**
+ * Selective <details> handling. The PR page renders every <details> block as a
+ * collapsible the reader can open — its content IS shown in the UI. Bots hide
+ * two very different things in them:
+ *   furniture — walkthroughs, share links, run config, lint-tool dumps …
+ *   substance — qodo findings (description/code/evidence/agent-prompt, each
+ *               with real diffs), CodeRabbit nitpick findings, proposed fixes.
+ * Furniture blocks are dropped whole. Substance blocks are unwrapped: the
+ * summary becomes a bold caption and the inner content (fences intact) stays.
+ *
+ * Blockquote-prefixed structures (qodo nests `> <details open>` with `>`-
+ * prefixed fences inside) are de-quoted first so their diffs unwrap as real
+ * fences instead of quoted text.
+ *
+ * Runs under maskedTransform: a fence that merely SHOWS <details> syntax is
+ * masked away and survives; kept fences travel through as inert tokens.
+ */
+function processDetailsBlocks(s, findingHeader) {
+    // De-quote blockquoted <details> regions (line-wise, one `>` level).
+    {
+        const lines = s.split("\n");
+        let depth = 0;
+        for (let i = 0; i < lines.length; i++) {
+            const un = lines[i].replace(/^[ \t]*>[ \t]?/, "");
+            const opens = (un.match(/<details\b/gi) || []).length;
+            const closes = (un.match(/<\/details>/gi) || []).length;
+            const inBlock = depth > 0 || opens > 0;
+            if (inBlock && /^[ \t]*>/.test(lines[i]))
+                lines[i] = un;
+            depth = Math.max(0, depth + opens - closes);
+        }
+        s = lines.join("\n");
+    }
+    return maskedTransform(s, (m) => {
+        // Innermost-first so nested blocks (qodo findings) resolve outward. The
+        // summary capture is tempered — it may not cross </summary> or a nested
+        // <details — so backtracking can never merge an outer summary with an
+        // inner one (which would mis-classify and swallow real content).
+        const re = /<details\b[^>]*>\s*(?:<summary>((?:(?!<\/summary>|<details\b)[\s\S])*?)<\/summary>)?((?:(?!<details\b)[\s\S])*?)<\/details>/i;
+        let guard = 0;
+        while (guard++ < 400) {
+            const match = re.exec(m);
+            if (!match)
+                break;
+            const whole = match[0];
+            const summaryHtml = match[1] || "";
+            const content = match[2] || "";
+            const plain = summaryHtml
+                .replace(/<[^>]+>/g, " ")
+                .replace(/\\\./g, ".")
+                .replace(/\s+/g, " ")
+                .trim();
+            // Classification key: lowercase, emoji/symbols removed — bots decorate
+            // furniture summaries with icons (ℹ️, ⚙️, 🪄 …) that must not defeat
+            // the pattern match. (ℹ is even \p{L}, so a leading-symbol strip fails.)
+            const key = plain.toLowerCase().replace(/[^a-z0-9 ()\/"'.,:;!?\-]/g, "").replace(/\s+/g, " ").trim();
+            const isFurniture = DETAILS_FURNITURE.some((p) => p.test(key));
+            let caption = plain ? `**${plain.replace(/\*\*/g, "")}**` : "";
+            // A numbered finding (qodo's "1. Verbose edit success messages …") is a
+            // review comment in its own right — give it the same commenter header
+            // every other comment gets, so findings read like the rest of the render
+            // instead of an invented caption style.
+            if (findingHeader && /^\d+\.\s/.test(key)) {
+                caption = `${findingHeader}\n\n${caption}`;
+            }
+            const inner = content.trim();
+            const replacement = isFurniture ? "" : `${caption}\n\n${inner}\n`;
+            m = m.slice(0, match.index) + replacement + m.slice(match.index + whole.length);
+        }
+        return m;
+    });
+}
 /** The text of `s` with fenced-block CONTENT removed — for scanning passes
  *  (e.g. severity extraction) that must not read code as prose. */
 function proseOnly(s) {
     return s.split(/```[\s\S]*?```/g).join("\n");
+}
+/** Lazy, cached local-repo reader for numberAnnotatedDiffFences. */
+function makeFenceNumberCtx(gitRoot, baseSha, headSha) {
+    const headCache = new Map();
+    const diffCache = new Map();
+    return {
+        headLines(path) {
+            if (!headCache.has(path))
+                headCache.set(path, readBlobLines(gitRoot, `${headSha}:${path}`));
+            return headCache.get(path);
+        },
+        diffRows(path) {
+            if (!diffCache.has(path)) {
+                let rows;
+                try {
+                    const diffText = execFileSync("git", ["diff", baseSha, headSha, "--", path], { cwd: gitRoot, encoding: "utf-8", timeout: GIT_LOCAL_TIMEOUT,
+                        stdio: ["pipe", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 }).toString();
+                    rows = [];
+                    // Parse every hunk (parseHunkHeader stops at the first, so walk).
+                    const lines = diffText.split("\n");
+                    for (let i = 0; i < lines.length; i++) {
+                        const h = lines[i].match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+                        if (!h)
+                            continue;
+                        let oldNum = parseInt(h[1], 10), newNum = parseInt(h[2], 10);
+                        for (let j = i + 1; j < lines.length && !lines[j].startsWith("@@"); j++) {
+                            const l = lines[j];
+                            if (l.startsWith("-"))
+                                rows.push({ oldNum: oldNum++, newNum: null, marker: "-", content: l.slice(1) });
+                            else if (l.startsWith("+"))
+                                rows.push({ oldNum: null, newNum: newNum++, marker: "+", content: l.slice(1) });
+                            else if (l.startsWith(" "))
+                                rows.push({ oldNum: oldNum++, newNum: newNum++, marker: " ", content: l.slice(1) });
+                            else if (l.startsWith("\\"))
+                                continue; // "\ No newline at end of file"
+                            else
+                                break; // next file header
+                        }
+                    }
+                }
+                catch {
+                    rows = undefined;
+                }
+                diffCache.set(path, rows);
+            }
+            return diffCache.get(path);
+        },
+    };
+}
+function numberAnnotatedDiffFences(s, ctx, anchor) {
+    const parts = s.split(/(```[\s\S]*?```)/g);
+    for (let i = 1; i < parts.length; i += 2) {
+        const fence = parts[i];
+        const m = fence.match(/^```diff[ \t]*\n([\s\S]*?)\n?```$/);
+        if (!m)
+            continue;
+        const bodyLines = m[1].split("\n");
+        if (bodyLines.some((l) => /^\s*\d+ [+\- ]/.test(l)))
+            continue; // already numbered
+        // Location annotations, two bot dialects:
+        //   qodo       — `path[R496-504]` directly in the preceding prose
+        //   coderabbit — `139-143`: at the finding start, with the file named in
+        //                a `**path/to/file.py (N)**` group header further up
+        let path = null;
+        let annStart = null;
+        const qodoAnns = [...parts[i - 1].matchAll(/`([^`\n\[]+)\[R?(\d+)(?:-R?\d+)?\]`/g)];
+        if (qodoAnns.length > 0) {
+            path = qodoAnns[qodoAnns.length - 1][1].trim();
+            annStart = parseInt(qodoAnns[qodoAnns.length - 1][2], 10);
+        }
+        else {
+            const crAnns = [...parts[i - 1].matchAll(/`(\d+)(?:-\d+)?`\s*:/g)];
+            if (crAnns.length > 0) {
+                annStart = parseInt(crAnns[crAnns.length - 1][1], 10);
+                // Nearest preceding **path (N)** header — search all prose before the
+                // fence (group headers can sit several findings up).
+                const before = parts.slice(0, i).join("");
+                const heads = [...before.matchAll(/\*\*([^*\n]+?)\s*\(\d+\)\*\*/g)]
+                    .map((h) => h[1].trim())
+                    .filter((p) => /[\/.]/.test(p) && !/\s/.test(p));
+                if (heads.length > 0)
+                    path = heads[heads.length - 1];
+            }
+        }
+        // Inline review comments carry their location as the thread anchor
+        // (path + commented line) rather than in prose — use it as the fallback.
+        if ((path == null || annStart == null) && anchor && anchor.line != null) {
+            path = path ?? anchor.path;
+            annStart = annStart ?? anchor.line;
+        }
+        if (path == null || annStart == null)
+            continue;
+        const rows = bodyLines.map((l) => {
+            if (l.startsWith("-"))
+                return { oldNum: null, newNum: null, marker: "-", content: l.slice(1) };
+            if (l.startsWith("+"))
+                return { oldNum: null, newNum: null, marker: "+", content: l.slice(1) };
+            const content = l.startsWith(" ") ? l.slice(1) : l;
+            return { oldNum: null, newNum: null, marker: " ", content };
+        });
+        // Two fence flavors, distinguished by which side exists in the HEAD blob:
+        //   PR diff (qodo)            — context+additions are the head file
+        //   suggestion (coderabbit)   — context+deletions are the head file
+        // Align whichever side actually matches the blob; number that side from
+        // the verified position and count the other side alongside.
+        const rightContents = rows.filter((r) => r.marker !== "-").map((r) => r.content);
+        const leftContents = rows.filter((r) => r.marker !== "+").map((r) => r.content);
+        const hl = ctx?.headLines(path);
+        const alignAt = (contents) => {
+            if (!hl || contents.length === 0)
+                return null;
+            const matchesAt = (w) => {
+                if (w < 1 || w - 1 + contents.length > hl.length)
+                    return false;
+                for (let k = 0; k < contents.length; k++) {
+                    if (hl[w - 1 + k] !== contents[k])
+                        return false;
+                }
+                return true;
+            };
+            for (let d = 0; d <= 300; d++) {
+                for (const w of d === 0 ? [annStart] : [annStart - d, annStart + d]) {
+                    if (matchesAt(w))
+                        return w;
+                }
+            }
+            return null;
+        };
+        const rightStart = alignAt(rightContents);
+        const leftStart = rightStart == null ? alignAt(leftContents) : null;
+        if (leftStart != null) {
+            // Suggestion flavor: old side (context+deletions) is the head file.
+            let oldNum = leftStart;
+            let newNum = leftStart;
+            for (const r of rows) {
+                if (r.marker === "-") {
+                    r.oldNum = oldNum++;
+                }
+                else if (r.marker === "+") {
+                    r.newNum = newNum++;
+                }
+                else {
+                    r.oldNum = oldNum++;
+                    r.newNum = newNum;
+                    newNum++;
+                }
+            }
+        }
+        else {
+            // PR-diff flavor (or no local verification — trust the annotation).
+            let newNum = rightStart ?? annStart;
+            const drows = rows.some((r) => r.marker === "-") ? ctx?.diffRows(path) : undefined;
+            for (const r of rows) {
+                if (r.marker === "-") {
+                    // Old-file number from the real diff: the matching deletion row
+                    // nearest to where we are in new-file space. Blank when unresolvable.
+                    if (drows) {
+                        let best = null;
+                        for (const d of drows) {
+                            if (d.marker !== "-" || d.content !== r.content || d.oldNum == null)
+                                continue;
+                            if (best === null || Math.abs(d.oldNum - newNum) < Math.abs(best.oldNum - newNum))
+                                best = d;
+                        }
+                        if (best)
+                            r.oldNum = best.oldNum;
+                    }
+                }
+                else {
+                    r.newNum = newNum;
+                    if (r.marker === " ")
+                        r.oldNum = newNum;
+                    newNum++;
+                }
+            }
+        }
+        parts[i] = "```diff\n" + renderNumberedRows(rows).join("\n") + "\n```";
+    }
+    return parts.join("");
 }
 /** A reference-definition line whose target is URL-shaped (`scheme://…`,
  *  `mailto:`/`tel:`, `<…>`, or starting with `/`, `./`, `#`). Footnotes
@@ -1023,27 +1314,19 @@ function stripLinkDebris(body) {
  *           HTML comments, collapsed bot boilerplate, share/promo/status
  *           lines, and whole comments that are nothing but promotion.
  */
-export function cleanCommentBody(raw) {
+export function cleanCommentBody(raw, findingHeader) {
     let s = (raw || "").replace(/\r\n/g, "\n");
     // HTML comments (bot metadata markers) — invisible on the rendered PR page.
     // Masked, not split: a multi-line comment may legitimately span a fence
     // (removed whole), while a code example SHOWING `<!-- … -->` is protected.
     s = maskedTransform(s, (m) => m.replace(/<!--[\s\S]*?-->/g, ""));
-    // Remove ALL <details> blocks — these are the collapsible boilerplate bots
-    // inject (walkthroughs, tips, share, rate-limit notices, "learnings", file
-    // lists, run config). Remove innermost first to handle nesting, and tolerate
-    // blockquote-prefixed tags (`> <details>`).
-    // Masked, not split: bot <details> footers routinely CONTAIN fenced code
-    // (CodeRabbit walkthroughs/logs) and must be removed whole, fence included;
-    // a fence that merely SHOWS a <details> tag is masked away and survives.
-    s = maskedTransform(s, (m) => {
-        let prev;
-        do {
-            prev = m;
-            m = m.replace(/<details\b[^>]*>(?:(?!<details\b)[\s\S])*?<\/details>/gi, "");
-        } while (m !== prev);
-        return m;
-    });
+    // <details> blocks — selective. The PR page shows these as collapsibles and
+    // MANY carry real review substance (qodo findings with their diffs,
+    // CodeRabbit nitpick findings / committable suggestions / proposed fixes).
+    // Deleting them all loses that data, so processDetailsBlocks keeps and
+    // unwraps content-bearing blocks and drops only known bot furniture
+    // (walkthroughs, share, run config, lint-tool dumps …). See its contract.
+    s = processDetailsBlocks(s, findingHeader);
     // Some bots double-escape newlines (literal "\n") in prose. Turn them into
     // real line breaks — but never inside fenced code blocks or inline code
     // spans, where "\n" is literal code.
@@ -1053,6 +1336,13 @@ export function cleanCommentBody(raw) {
     s = transformProse(s, (seg) => seg
         .replace(/[ \t]*<picture>[\s\S]*?<\/picture>/gi, "")
         .replace(/[ \t]*<img\b[^>]*>/gi, ""));
+    // Qodo wraps finding prose in <pre> hard-wrapped at ~100 columns. The UI
+    // shows it as one flowing block; in markdown those mid-sentence newlines
+    // read as broken paragraphs. Reflow: single newlines inside <pre> become
+    // spaces, blank-line paragraph breaks survive. (The <pre> tags themselves
+    // are stripped later with the other stray tags.) Fence/inline-code content
+    // is protected by transformProse.
+    s = transformProse(s, (seg) => seg.replace(/<pre>\s*([\s\S]*?)\s*<\/pre>/gi, (_m, inner) => "\n" + inner.replace(/([^\n])\n(?!\n)/g, "$1 ") + "\n"));
     // Light HTML → Markdown so bot summaries stay readable. The <a> unwrap
     // keeps the visible text and drops the target — link text is content,
     // the URL is web furniture. All fence-guarded.
@@ -1063,7 +1353,17 @@ export function cleanCommentBody(raw) {
         .replace(/<(?:i|em)>\s*<(?:b|strong)>([\s\S]*?)<\/(?:b|strong)>\s*<\/(?:i|em)>/gi, (_m, x) => "`" + x.replace(/<[^>]+>/g, "").replace(/`/g, "").trim() + "`")
         .replace(/<\/?(?:strong|b)>/gi, "**")
         .replace(/<\/?(?:em|i)>/gi, "*")
-        .replace(/<code>([\s\S]*?)<\/code>/gi, (_m, x) => "`" + x.replace(/`/g, "").trim() + "`")
+        // <code> → inline code. Bots put markdown links INSIDE <code> (qodo's
+        // file-location and rule links); once backticked they'd be shielded
+        // from stripLinkDebris, so unwrap them here — keep the visible text
+        // (tolerating one nested [bracket] pair: "path.ts[R496-504]"), drop
+        // the URL.
+        .replace(/<code>([\s\S]*?)<\/code>/gi, (_m, x) => {
+        const text = x
+            .replace(/\[((?:[^\[\]]|\[[^\]]*\])*)\]\((?:[^()]|\([^()]*\))*\)/g, "$1")
+            .replace(/`/g, "").trim();
+        return text ? "`" + text + "`" : "";
+    })
         .replace(/<h[1-6]>([\s\S]*?)<\/h[1-6]>/gi, (_m, x) => `\n**${x.trim()}**\n`)
         .replace(/<li>([\s\S]*?)<\/li>/gi, (_m, x) => `- ${x.trim()}\n`)
         .replace(/<br\s*\/?>/gi, "\n"));
@@ -1116,6 +1416,26 @@ export function cleanCommentBody(raw) {
             return true;
         if (/for more details on the timeline and next steps/i.test(t))
             return true;
+        // ⓘ-prefixed bot annotations ("ⓘ Copy this prompt …", "ⓘ Recommendations
+        // generated …") — process notes, not review content. Often <code>-wrapped,
+        // so tolerate a leading backtick.
+        if (/^`?\u24d8/u.test(t))
+            return true;
+        // Bare cross-PR reference lines qodo appends under "Relevance" ("PR-#32") —
+        // link husks. Matched in both pre-unwrap ([PR-#32](url)) and bare form,
+        // since dropLine runs before stripLinkDebris.
+        if (/^(?:\[PR-#\d+\]\([^)]*\)|PR-#\d+)$/.test(t))
+            return true;
+        if (/customize macroscope'?s approvability policy/i.test(t))
+            return true;
+        // Qodo's card-top furniture: the "Code Review by Qodo" banner (the card
+        // header above already names the commenter) and its badge-counter strip
+        // (`🐞 Bugs (2)` `📘 Rule violations (2)` …) — a summary widget, not
+        // review content.
+        if (/^\**\s*code review by qodo\s*\**$/i.test(t))
+            return true;
+        if (/^(?:`[^`]*\(\d+\)`\s*){2,}$/.test(t))
+            return true;
         return false;
     };
     s = filterProseLines(s, (line) => !dropLine(line));
@@ -1132,6 +1452,11 @@ export function cleanCommentBody(raw) {
     // "---"). A bare rule at the edges only collides with the section separators
     // renderPR emits, producing an ugly double "---".
     s = s.replace(/^(?:[-*_]{3,}\s*\n)+/g, "").replace(/(?:\n\s*[-*_]{3,})+\s*$/g, "").trim();
+    // A per-finding header that ended up as the very FIRST line duplicates the
+    // card header the renderer prints right above the body — collapse it.
+    if (findingHeader && s.startsWith(findingHeader)) {
+        s = s.slice(findingHeader.length).trim();
+    }
     // If nothing but punctuation / rules / emoji remains, treat as empty so the
     // card is skipped rather than printed as a stray "---" or lone symbol.
     if (!/[\p{L}\p{N}]/u.test(s))
@@ -1145,6 +1470,11 @@ export async function renderPR(data, options) {
     const { pr, commits, reviews, issueComments, resolvedThreadMap, unifiedChecks } = data;
     const { outputPath, includeResolvedThreads = true } = options;
     const cards = buildCards(issueComments, reviews, data.reviewComments, resolvedThreadMap, includeResolvedThreads);
+    // Local-repo context for numbering bot diff fences (qodo) against the real
+    // blobs. Only active when a local clone is available.
+    const fenceCtx = options.gitRoot
+        ? makeFenceNumberCtx(options.gitRoot, pr.base.sha, pr.head.sha)
+        : undefined;
     const out = [];
     // Writes go to a switchable target so the Comments flow can be buffered and
     // its heading emitted only when at least one card actually rendered.
@@ -1207,7 +1537,7 @@ export async function renderPR(data, options) {
     // file + anchor, a line-numbered ```diff code-context block, the comment
     // prose, then any suggested change as its own numbered ```diff changeset,
     // followed by real replies (no UI reply boxes or action buttons).
-    const writeThreadMd = (thread, resolved) => {
+    const writeThreadMd = (thread, resolved, insideReview = false) => {
         const root = thread.rootComment;
         const filePath = root.path;
         const sl = root.start_line ?? root.original_start_line ?? null;
@@ -1216,8 +1546,17 @@ export async function renderPR(data, options) {
         const outdatedTag = thread.isOutdated && !resolved ? " _(outdated)_" : "";
         const severity = extractSeverity(proseOnly(root.body || ""));
         const severityTag = severity ? ` · Severity: ${severity}` : "";
-        w(`${actorEmoji(root.user)} **${displayActor(root.user)}** reviewed · ${formatDate(root.created_at)}${severityTag}`);
-        blank();
+        // A standalone thread card leads with its author — it IS the comment.
+        // Inside a review card the UI shows a file/diff box with the commenter's
+        // note BELOW the diff, so the author line renders there instead (the
+        // review header above already names who reviewed).
+        const authorLine = insideReview
+            ? `${actorEmoji(root.user)} **${displayActor(root.user)}** · ${formatDate(root.created_at)}${severityTag}`
+            : `${actorEmoji(root.user)} **${displayActor(root.user)}** reviewed · ${formatDate(root.created_at)}${severityTag}`;
+        if (!insideReview) {
+            w(authorLine);
+            blank();
+        }
         w(`\`${filePath}\` — ${lineAnchor(root)}${outdatedTag}`);
         blank();
         const ctx = codeContextDiffLines(root.diff_hunk || "", rangeSize);
@@ -1228,7 +1567,11 @@ export async function renderPR(data, options) {
             w("```");
             blank();
         }
-        const body = cleanCommentBody(stripSeverityLine(stripSuggestionBlocks(root.body || "")));
+        if (insideReview) {
+            w(authorLine);
+            blank();
+        }
+        const body = numberAnnotatedDiffFences(cleanCommentBody(stripSeverityLine(stripSuggestionBlocks(root.body || ""))), fenceCtx, { path: filePath, line: sl ?? el });
         if (body) {
             w(body);
             blank();
@@ -1261,7 +1604,7 @@ export async function renderPR(data, options) {
             const rSeverityTag = rSeverity ? ` · Severity: ${rSeverity}` : "";
             w(`${actorEmoji(reply.user)} **${displayActor(reply.user)}** replied · ${formatDate(reply.created_at)}${rSeverityTag}`);
             blank();
-            const rbody = cleanCommentBody(stripSeverityLine(stripSuggestionBlocks(reply.body || "")));
+            const rbody = numberAnnotatedDiffFences(cleanCommentBody(stripSeverityLine(stripSuggestionBlocks(reply.body || ""))), fenceCtx, { path: reply.path || filePath, line: (reply.start_line ?? reply.original_start_line ?? sl) ?? (reply.line ?? reply.original_line ?? el) });
             if (rbody) {
                 w(rbody);
                 blank();
@@ -1326,6 +1669,17 @@ export async function renderPR(data, options) {
             resolvedThreads.push(card.thread);
             continue;
         }
+        // Threads submitted with a review render INSIDE its card (one card per
+        // review, like the PR page). Resolved ones still route to "## Resolved".
+        let reviewThreads = [];
+        if (card.kind === "review_event") {
+            for (const t of card.threads || []) {
+                if (t.isResolved === true)
+                    resolvedThreads.push(t);
+                else
+                    reviewThreads.push(t);
+            }
+        }
         // Build the card content first so cards that are pure bot boilerplate
         // (empty after cleaning, with no review verdict) can be skipped without
         // consuming a Comment number.
@@ -1333,19 +1687,23 @@ export async function renderPR(data, options) {
         let body = "";
         if (card.kind === "issue_comment") {
             const c = card.data;
-            body = cleanCommentBody(c.body || "");
+            header = `${actorEmoji(c.user)} **${displayActor(c.user)}** commented · ${formatDate(c.created_at)}`;
+            // The commenter line doubles as the per-finding header for bots (qodo)
+            // that pack several numbered findings into one body — each finding gets
+            // re-captioned exactly like a comment, so the render stays one visual
+            // language.
+            body = numberAnnotatedDiffFences(cleanCommentBody(c.body || "", `${actorEmoji(c.user)} **${displayActor(c.user)}** · ${formatDate(c.created_at)}`), fenceCtx);
             if (!body)
                 continue;
-            header = `${actorEmoji(c.user)} **${displayActor(c.user)}** commented · ${formatDate(c.created_at)}`;
         }
         else if (card.kind === "review_event") {
             const r = card.data;
-            body = cleanCommentBody(r.body || "");
+            header = `${actorEmoji(r.user)} **${displayActor(r.user)}** ${reviewVerb(r.state)} · ${formatDate(r.submitted_at || r.created_at)}`;
+            body = numberAnnotatedDiffFences(cleanCommentBody(r.body || "", `${actorEmoji(r.user)} **${displayActor(r.user)}** · ${formatDate(r.submitted_at || r.created_at)}`), fenceCtx);
             const verdict = String(r.state || "").toUpperCase();
             const hasVerdict = verdict === "CHANGES_REQUESTED" || verdict === "APPROVED" || verdict === "DISMISSED";
-            if (!body && !hasVerdict)
+            if (!body && !hasVerdict && reviewThreads.length === 0)
                 continue;
-            header = `${actorEmoji(r.user)} **${displayActor(r.user)}** ${reviewVerb(r.state)} · ${formatDate(r.submitted_at || r.created_at)}`;
         }
         blank();
         w(`### Comment #${n++}`);
@@ -1358,6 +1716,10 @@ export async function renderPR(data, options) {
             if (body) {
                 blank();
                 w(body);
+            }
+            for (const t of reviewThreads) {
+                blank();
+                writeThreadMd(t, false, true);
             }
         }
     }

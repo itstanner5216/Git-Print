@@ -17,6 +17,7 @@ export interface PRRendererOptions {
     graphqlToken?: string;
     includeResolvedThreads?: boolean;
     fetchCheckAnnotations?: boolean;
+    gitRoot?: string;
 }
 /** Typed subset of the GitHub Pull Request API response — covers every field accessed in this codebase. */
 export interface PRMetadata {
@@ -239,7 +240,7 @@ export declare function attachAutomatedSuggestions(prHtmlUrl: string | undefined
  *           HTML comments, collapsed bot boilerplate, share/promo/status
  *           lines, and whole comments that are nothing but promotion.
  */
-export declare function cleanCommentBody(raw: string): string;
+export declare function cleanCommentBody(raw: string, findingHeader?: string): string;
 export declare function renderPR(data: PRData, options: PRRendererOptions): Promise<void>;
 export declare function renderReport(data: PRData, options: PRRendererOptions): Promise<void>;
 /**

@@ -972,6 +972,7 @@ async function main(): Promise<void> {
     graphqlToken: token,
     includeResolvedThreads: true,
     fetchCheckAnnotations: true,
+    gitRoot,
   };
 
   if (isResolveMode) {
@@ -1117,11 +1118,16 @@ async function main(): Promise<void> {
 }
 
 // Only run main() when executed as a script — not when imported (e.g. by tests
-// that exercise parseGitHubRemote).
+// that exercise parseGitHubRemote). Resolve the real path in case the binary is
+// invoked via a symlink (npm link / pnpm link).
 const isEntry = (() => {
   try {
-    const entry = process.argv[1] ?? "";
-    return entry.endsWith("cli.js") || entry.endsWith("cli.ts");
+    const { resolve } = require("node:path");
+    const argv1 = process.argv[1] ?? "";
+    const basename = require("node:path").basename(argv1);
+    if (basename === "git-print" || basename === "git-print.cmd") return true;
+    const real = resolve(argv1);
+    return real.endsWith("cli.js") || real.endsWith("cli.ts") || basename === "cli.js" || basename === "cli.ts";
   } catch { return true; }
 })();
 
@@ -1161,6 +1167,7 @@ async function runAuto(): Promise<void> {
       owner: remote.owner, repo: remote.repo,
       pullNumber: prNumber, token, outputPath: "",
       graphqlToken: token, includeResolvedThreads: true, fetchCheckAnnotations: true,
+      gitRoot,
     };
     const reviewPath   = join(outputDir, `PR-${prNumber}-review.md`);
     const reportPath   = join(outputDir, `PR-${prNumber}-report.md`);

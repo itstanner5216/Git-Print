@@ -2229,10 +2229,8 @@ export async function renderReport(data: PRData, options: PRRendererOptions): Pr
     w();
 
     for (const fc of failed) {
-      const dur = formatDuration(fc.startedAt, fc.completedAt);
       w(`### ✗ ${fc.name}`);
       w();
-      if (dur) { w(`_Duration: ${dur}_`); w(); }
 
       let hasDetails = false;
       let genericAnns: any[] = [];
@@ -2389,9 +2387,7 @@ export async function renderReport(data: PRData, options: PRRendererOptions): Pr
     w(`## ✓ Passed (${passed.length})`);
     w();
     for (const c of passed) {
-      const dur = formatDuration(c.startedAt, c.completedAt);
-      const durStr = dur ? ` — ${dur}` : "";
-      w(`- ✓ ${c.name}${durStr}`);
+      w(`- ✓ ${c.name}`);
     }
     w();
   }
@@ -2417,24 +2413,43 @@ export async function renderReport(data: PRData, options: PRRendererOptions): Pr
   w(`## Changed Files (${files.length}) — +${pr.additions} / -${pr.deletions}`);
   w();
 
-  // Sort: removed first, then modified, then added, then renamed/copied
-  const statusOrder: Record<string, number> = {
-    removed: 0, modified: 1, renamed: 2, copied: 3, added: 4,
+  // Group by change type so the status word isn't repeated on every row, then
+  // list each file path-first (names scan straight down the left edge). Stats
+  // trail as a light annotation, and a zero side is dropped (an added file has
+  // no deletions; a deleted file, no additions).
+  const fileGroups: Array<[string, string]> = [
+    ["modified", "Modified"], ["added", "Added"], ["removed", "Deleted"],
+    ["renamed", "Renamed"], ["copied", "Copied"],
+  ];
+  const fmtStat = (adds: number, dels: number): string => {
+    const parts: string[] = [];
+    if (adds) parts.push(`+${adds}`);
+    if (dels) parts.push(`-${dels}`);
+    return parts.length ? ` [${parts.join(" | ")}]` : "";
   };
-  const sortedFiles = [...files].sort((a: any, b: any) => {
-    return (statusOrder[a.status] ?? 5) - (statusOrder[b.status] ?? 5);
-  });
-
-  for (const f of sortedFiles) {
-    const adds = f.additions ?? 0;
-    const dels = f.deletions ?? 0;
-    const stats = `+${adds} / -${dels}`;
-
-    if (f.status === "renamed") {
-      w(`- **renamed** \`${f.previous_filename}\` → \`${f.filename}\` (${stats})`);
+  const knownStatuses = new Set(fileGroups.map(([s]) => s));
+  const emitFile = (f: any) => {
+    const stat = fmtStat(f.additions ?? 0, f.deletions ?? 0);
+    if ((f.status === "renamed" || f.status === "copied") && f.previous_filename) {
+      w(`- \`${f.previous_filename}\` → \`${f.filename}\`${stat}`);
     } else {
-      w(`- **${f.status}** \`${f.filename}\` (${stats})`);
+      w(`- \`${f.filename}\`${stat}`);
     }
+  };
+  for (const [status, label] of fileGroups) {
+    const group = files.filter((f: any) => f.status === status);
+    if (group.length === 0) continue;
+    w(`**${label}**`);
+    for (const f of group) emitFile(f);
+    w();
+  }
+  const otherFiles = files.filter((f: any) => !knownStatuses.has(f.status));
+  if (otherFiles.length > 0) {
+    w(`**Other**`);
+    for (const f of otherFiles) {
+      w(`- \`${f.filename}\` (${f.status})${fmtStat(f.additions ?? 0, f.deletions ?? 0)}`);
+    }
+    w();
   }
   w();
 

@@ -140,6 +140,8 @@ npm install -g github:itstanner5216/Git-Print   # installs the git-print command
 git-print install                                # hooks + CI reporter + a durable launcher
 ```
 
+> **On npm 12+, git installs are off by default.** If the first command fails with `EALLOWGIT`, run `npm config set allow-git all` once, then retry.
+
 Two commands, both **idempotent** — re-run them any time. `npm install -g` puts `git-print` on your PATH; `git-print install` wires up the pre-push conflict hook and CI-failure reporter for your registered repos, and drops a **node-version-independent** launcher into `~/.local/bin` (override with `$GIT_PRINT_BIN_DIR`).
 
 That launcher matters: `npm install -g` on its own lands in the *active* node's bin dir, so it falls off your PATH the moment you switch node versions (nvm / volta / asdf). The `~/.local/bin` launcher keeps `git-print` working across those switches.

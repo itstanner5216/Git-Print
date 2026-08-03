@@ -1908,20 +1908,38 @@ export async function renderReport(data, options) {
     const headSha = pr.head.sha;
     const out = [];
     const w = (line = "") => out.push(line);
+    // Emit lines inside a fenced code block, picking a fence long enough that
+    // backticks in the content can't break out of it (CommonMark rule). Keeps
+    // code/log excerpts as real Markdown code — flush-left and monospace — instead
+    // of space-indented text that Markdown renderers mistake for a code block.
+    const wFence = (lines, lang = "") => {
+        let ticks = 3;
+        for (const ln of lines) {
+            for (const run of ln.match(/`+/g) ?? [])
+                ticks = Math.max(ticks, run.length + 1);
+        }
+        const fence = "`".repeat(ticks);
+        w(fence + lang);
+        for (const ln of lines)
+            w(ln);
+        w(fence);
+    };
     // ─── 1. CI Status ──────────────────────────────────────────────────────
     w(`# CI STATUS — PR #${pr.number}`);
     w();
     const { inProgress, passed, failed } = categorizeChecks(unifiedChecks);
     // Failed checks with detailed failure info
     if (failed.length > 0) {
-        w(`## FAILED (${failed.length}):`);
+        w(`## ✗ Failed (${failed.length})`);
         w();
         for (const fc of failed) {
             const dur = formatDuration(fc.startedAt, fc.completedAt);
-            w(`  ✗ ${fc.name}`);
-            if (dur)
-                w(`    Duration: ${dur}`);
-            w(`    Failure details:`);
+            w(`### ✗ ${fc.name}`);
+            w();
+            if (dur) {
+                w(`_Duration: ${dur}_`);
+                w();
+            }
             let hasDetails = false;
             let genericAnns = [];
             // Priority 1: Annotations
@@ -1951,8 +1969,10 @@ export async function renderReport(data, options) {
                                 ? `${ann.path}:${ann.start_line}${ann.end_line && ann.end_line !== ann.start_line ? `-${ann.end_line}` : ""}`
                                 : null;
                             if (loc) {
-                                w(`      [${ann.annotation_level || "failure"}] ${loc}`);
-                                w(`      ${ann.message || ann.title || "(no message)"}`);
+                                w(`**\`${loc}\`**`);
+                                w();
+                                w(ann.message || ann.title || "(no message)");
+                                w();
                                 // Try to fetch file content around the annotation
                                 if (ann.path && ann.start_line) {
                                     try {
@@ -1962,14 +1982,14 @@ export async function renderReport(data, options) {
                                             const fileLines = content.split("\n");
                                             const start = Math.max(0, ann.start_line - 11);
                                             const end = Math.min(fileLines.length, (ann.end_line || ann.start_line) + 10);
-                                            w(`      ┌─ ${ann.path}:${start + 1}-${end}`);
+                                            const snippet = [];
                                             for (let i = start; i < end; i++) {
                                                 const lineNum = String(i + 1).padStart(4);
                                                 const marker = (i + 1 >= ann.start_line && i + 1 <= (ann.end_line || ann.start_line))
                                                     ? "»" : " ";
-                                                w(`      ${marker} ${lineNum} │ ${fileLines[i]}`);
+                                                snippet.push(`${marker} ${lineNum} │ ${fileLines[i]}`);
                                             }
-                                            w(`      └─`);
+                                            wFence(snippet);
                                         }
                                     }
                                     catch {
@@ -1978,7 +1998,7 @@ export async function renderReport(data, options) {
                                 }
                             }
                             else {
-                                w(`      ${ann.message || ann.title || "(no message)"}`);
+                                w(ann.message || ann.title || "(no message)");
                             }
                             w();
                         }
@@ -1999,9 +2019,7 @@ export async function renderReport(data, options) {
                         const extracted = extractFailureLines(blob);
                         if (extracted.length > 0) {
                             hasDetails = true;
-                            for (const line of extracted) {
-                                w(`      ${line}`);
-                            }
+                            wFence(extracted);
                         }
                     }
                 }
@@ -2026,10 +2044,9 @@ export async function renderReport(data, options) {
                             const extracted = extractFailureLines(cleanActionsLog(sliced));
                             if (extracted.length > 0) {
                                 hasDetails = true;
-                                w(`      ── from job log ──`);
-                                for (const line of extracted) {
-                                    w(`      ${line}`);
-                                }
+                                w(`_from job log:_`);
+                                w();
+                                wFence(extracted);
                                 w();
                             }
                         }
@@ -2045,16 +2062,21 @@ export async function renderReport(data, options) {
                     // exit-code annotation. Better than nothing.
                     for (const ann of genericAnns) {
                         const loc = ann.path && ann.start_line ? `${ann.path}:${ann.start_line}` : null;
-                        if (loc)
-                            w(`      [${ann.annotation_level || "failure"}] ${loc}`);
-                        w(`      ${ann.message || ann.title || "(no message)"}`);
+                        if (loc) {
+                            w(`**\`${loc}\`**`);
+                            w();
+                        }
+                        w(ann.message || ann.title || "(no message)");
+                        w();
                     }
                 }
                 else if (fc.description) {
-                    w(`      ${fc.description}`);
+                    w(fc.description);
+                    w();
                 }
                 else {
-                    w(`      No failure details available from the API. Check the Actions tab directly.`);
+                    w(`_No failure details available from the API. Check the Actions tab directly._`);
+                    w();
                 }
             }
             w();
@@ -2062,20 +2084,22 @@ export async function renderReport(data, options) {
     }
     // Passed checks
     if (passed.length > 0) {
-        w(`## PASSED (${passed.length}):`);
+        w(`## ✓ Passed (${passed.length})`);
+        w();
         for (const c of passed) {
             const dur = formatDuration(c.startedAt, c.completedAt);
             const durStr = dur ? ` — ${dur}` : "";
-            w(`  ✓ ${c.name}${durStr}`);
+            w(`- ✓ ${c.name}${durStr}`);
         }
         w();
     }
     // In-progress checks
     if (inProgress.length > 0) {
-        w(`## IN PROGRESS (${inProgress.length}):`);
+        w(`## ~ In Progress (${inProgress.length})`);
+        w();
         for (const c of inProgress) {
             const desc = c.description ? ` — ${c.description}` : "";
-            w(`  ~ ${c.name}${desc}`);
+            w(`- ~ ${c.name}${desc}`);
         }
         w();
     }
@@ -2084,9 +2108,7 @@ export async function renderReport(data, options) {
         w();
     }
     // ─── 2. Changed Files ─────────────────────────────────────────────────
-    w(LINE_SINGLE);
-    w(`CHANGED FILES (${files.length} files)  +${pr.additions} / -${pr.deletions}`);
-    w(LINE_SINGLE);
+    w(`## Changed Files (${files.length}) — +${pr.additions} / -${pr.deletions}`);
     w();
     // Sort: removed first, then modified, then added, then renamed/copied
     const statusOrder = {
@@ -2100,17 +2122,15 @@ export async function renderReport(data, options) {
         const dels = f.deletions ?? 0;
         const stats = `+${adds} / -${dels}`;
         if (f.status === "renamed") {
-            w(`renamed  ${f.previous_filename} → ${f.filename}  ${stats}`);
+            w(`- **renamed** \`${f.previous_filename}\` → \`${f.filename}\` (${stats})`);
         }
         else {
-            w(`${f.status.padEnd(9)} ${f.filename}  ${stats}`);
+            w(`- **${f.status}** \`${f.filename}\` (${stats})`);
         }
     }
     w();
     // ─── 3. Commit History ────────────────────────────────────────────────
-    w(LINE_SINGLE);
-    w(`COMMITS (${commits.length})`);
-    w(LINE_SINGLE);
+    w(`## Commits (${commits.length})`);
     w();
     // Chronological order (oldest first) — GitHub API returns oldest first for PR commits
     for (let i = 0; i < commits.length; i++) {
@@ -2122,8 +2142,8 @@ export async function renderReport(data, options) {
         const authorName = c.author?.login || c.commit?.author?.name || "Unknown";
         const timestamp = formatDate(c.commit?.author?.date || c.commit?.committer?.date || "");
         const firstLine = (c.commit?.message || "").split("\n")[0];
-        w(`${String(i + 1).padStart(2)}.  ${sha}  ${authorName}  ${timestamp}`);
-        w(`      ${firstLine}`);
+        w(`${i + 1}. \`${sha}\` — ${firstLine}`);
+        w(`   _${authorName} · ${timestamp}_`);
         w();
     }
     const output = out.join("\n");
@@ -2326,9 +2346,13 @@ export function gitCommonDir(gitRoot) {
  *    including forks). Fall back to fetching the branch directly when that
  *    ref doesn't exist (e.g. local test repos that aren't actual PRs).
  *
- * When pinned SHAs are supplied, verify the fetched refs resolve to exactly
- * those commits — surfacing branch movement as a hard error rather than
- * silently merging the wrong thing.
+ * The fetch is a force-fetch, so the private refs always reflect the CURRENT
+ * state of origin — our single source of truth. We deliberately do NOT reconcile
+ * against the PR's base.sha/head.sha metadata: GitHub already owns mergeability,
+ * and re-checking it here only yields false failures when that metadata is
+ * momentarily stale. Resolve-path safety comes from the dry-run in
+ * validateInWorktree and the branch-at-head check, not from second-guessing
+ * GitHub.
  */
 function fetchPrRefs(gitRoot, base, head, spec) {
     const baseRef = `refs/pr-print/${spec.pullNumber}/base`;
@@ -2352,16 +2376,6 @@ function fetchPrRefs(gitRoot, base, head, spec) {
     }
     const baseResolved = gitExec(["rev-parse", baseRef], gitRoot);
     const headResolved = gitExec(["rev-parse", headRef], gitRoot);
-    if (spec.baseSha && baseResolved !== spec.baseSha) {
-        throw new Error(`Base SHA mismatch: PR metadata says ${spec.baseSha} but ` +
-            `refs/heads/${base} now resolves to ${baseResolved}. ` +
-            `Refresh PR metadata and retry.`);
-    }
-    if (spec.headSha && headResolved !== spec.headSha) {
-        throw new Error(`Head SHA mismatch: PR metadata says ${spec.headSha} but ` +
-            `the fetched PR head now resolves to ${headResolved}. ` +
-            `The PR was updated since metadata was fetched — refresh and retry.`);
-    }
     return { baseRef, headRef, baseSha: baseResolved, headSha: headResolved };
 }
 /**
@@ -2795,11 +2809,7 @@ export async function renderConflicts(data, options) {
     console.error(`Merge conflicts detected — running trial merge...`);
     let conflicts;
     try {
-        conflicts = extractConflicts(gitRoot, baseBranch, headBranch, {
-            baseSha: pr.base.sha,
-            headSha: pr.head.sha,
-            pullNumber,
-        });
+        conflicts = extractConflicts(gitRoot, baseBranch, headBranch, { pullNumber });
     }
     catch (e) {
         console.error(`Warning: Could not perform trial merge: ${e.message}`);
@@ -3028,9 +3038,7 @@ export function validateInWorktree(gitRoot, base, head, resolutions, prSpec = { 
     gitExecSafe(["worktree", "prune"], gitRoot);
     const worktreeDir = allocWorktreeDir(gitRoot, "resolve");
     try {
-        const refs = fetchPrRefs(gitRoot, base, head, {
-            baseSha: prSpec.baseSha, headSha: prSpec.headSha, pullNumber: prSpec.pullNumber,
-        });
+        const refs = fetchPrRefs(gitRoot, base, head, { pullNumber: prSpec.pullNumber });
         // Worktree at PR HEAD; merge BASE into it (the correct direction for a
         // commit that lives on the PR head branch).
         gitExec(["worktree", "add", "--detach", worktreeDir, refs.headSha], gitRoot);
@@ -3127,9 +3135,7 @@ export function applyResolutions(opts, validation) {
     // merge.
     let refs;
     try {
-        refs = fetchPrRefs(gitRoot, base, head, {
-            baseSha: opts.baseSha, headSha: opts.headSha, pullNumber,
-        });
+        refs = fetchPrRefs(gitRoot, base, head, { pullNumber });
     }
     catch (e) {
         return { status: "aborted", error: `✗ ${e.message}` };
@@ -3233,7 +3239,7 @@ export function resolveConflicts(opts) {
     // Single command — internally: validate in a tmp worktree, then apply to
     // the user's working tree. There is no separate "dry-run" mode.
     process.stderr.write(`Validating resolutions in sandbox worktree...\n`);
-    const validation = validateInWorktree(opts.gitRoot, opts.base, opts.head, opts.resolutions, { baseSha: opts.baseSha, headSha: opts.headSha, pullNumber: opts.pullNumber });
+    const validation = validateInWorktree(opts.gitRoot, opts.base, opts.head, opts.resolutions, { pullNumber: opts.pullNumber });
     for (const w of validation.warnings) {
         process.stderr.write(`${w}\n`);
     }

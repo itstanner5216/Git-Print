@@ -831,11 +831,7 @@ async function renderTrialMergeConflicts(data, opts) {
     console.error(`Merge conflicts detected — running in-memory trial merge...`);
     let conflicts;
     try {
-        conflicts = extractConflicts(gitRoot, baseBranch, headBranch, {
-            baseSha: pr.base.sha,
-            headSha: pr.head.sha,
-            pullNumber,
-        });
+        conflicts = extractConflicts(gitRoot, baseBranch, headBranch, { pullNumber });
     }
     catch (e) {
         const minimal = `# ⚠ Merge Conflicts — PR #${pullNumber}\n\n\`${headBranch}\` does not merge cleanly into \`${baseBranch}\`\n\nCould not perform a local trial merge to extract conflict details.\nError: ${e.message}\n`;
@@ -925,11 +921,7 @@ async function main() {
             }
             // Need to figure out which files conflict
             console.error(`Detecting conflict files for bare flag resolution...`);
-            const conflicts = extractConflicts(gitRoot, baseBranch, headBranch, {
-                baseSha: pr.base.sha,
-                headSha: pr.head.sha,
-                pullNumber: prNumber,
-            });
+            const conflicts = extractConflicts(gitRoot, baseBranch, headBranch, { pullNumber: prNumber });
             const conflictPaths = conflicts.map(c => c.path);
             if (conflictPaths.length === 0) {
                 console.error(`No conflicts found — PR merges cleanly.`);
@@ -958,8 +950,6 @@ async function main() {
             pullNumber: prNumber, token,
             base: baseBranch,
             head: headBranch,
-            baseSha: pr.base.sha,
-            headSha: pr.head.sha,
             resolutions,
         });
         if (result.status === "aborted") {

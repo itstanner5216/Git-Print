@@ -141,11 +141,6 @@ export interface ResolveOptions {
     token: string;
     base: string;
     head: string;
-    /** Optional immutable SHA pins from the PR metadata. When provided, the
-     *  resolver verifies fetched refs match exactly — protecting against the
-     *  branches moving between the metadata fetch and the merge. */
-    baseSha?: string;
-    headSha?: string;
     resolutions: Map<string, "baseline" | "incoming">;
 }
 /** Index-state fingerprint — git's content-addressable oid + mode for a kept
@@ -253,10 +248,6 @@ export declare function renderReport(data: PRData, options: PRRendererOptions): 
  */
 export declare function gitCommonDir(gitRoot: string): string;
 interface PrRefSpec {
-    /** Optional pinned base SHA from the PR metadata — when present, we verify. */
-    baseSha?: string;
-    /** Optional pinned head SHA from the PR metadata — when present, we verify. */
-    headSha?: string;
     /** PR number; used to namespace the private refs we fetch into. */
     pullNumber: number;
 }
@@ -322,7 +313,7 @@ export declare function extractConflicts(gitRoot: string, base: string, head: st
 export declare function renderConflicts(data: PRData, options: PRRendererOptions & {
     gitRoot: string;
 }): Promise<string | null>;
-export declare function validateInWorktree(gitRoot: string, base: string, head: string, resolutions: Map<string, "baseline" | "incoming">, prSpec?: Pick<ResolveOptions, "baseSha" | "headSha" | "pullNumber">): ValidationResult;
+export declare function validateInWorktree(gitRoot: string, base: string, head: string, resolutions: Map<string, "baseline" | "incoming">, prSpec?: Pick<ResolveOptions, "pullNumber">): ValidationResult;
 export declare function applyResolutions(opts: ResolveOptions, validation: ValidationResult): ResolveResult;
 export declare function resolveConflicts(opts: ResolveOptions): ResolveResult;
 export {};

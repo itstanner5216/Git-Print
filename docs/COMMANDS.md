@@ -17,11 +17,13 @@
   # compiles TypeScript (src/) → dist/
   ```
 
-- [ ] **Link the binary globally** *(optional, one-time)*
+- [ ] **Install the `git-print` command**
   ```bash
-  npm link
-  # makes `git-print` available system-wide
+  node dist/cli.js install     # from this clone (idempotent; also sets up hooks + CI)
+  # or, without cloning:  npm install -g github:itstanner5216/Git-Print
   ```
+  Both put a node-version-independent launcher in `~/.local/bin`. Avoid `npm link`
+  — it installs into the *active* node's bin and vanishes when you switch versions.
 
 - [ ] **Set your GitHub token** *(required)*
   ```bash
@@ -114,13 +116,15 @@
 > Subcommands for wiring git-print into your repos and CI. These don't take a PR
 > number — they operate on registered repos or the current repo.
 
-- [ ] **Register a repo & install hooks + CI reporter**
+- [ ] **Install everything** *(idempotent — safe to re-run any time)*
   ```bash
   git-print install
-  # • registers the current repo
-  # • installs a post-merge "auto" conflict hook
-  # • writes a CI-failure reporter workflow into every registered GitHub repo:
+  # • installs a node-version-independent `git-print` launcher on your PATH
+  #     (~/.local/bin, or $GIT_PRINT_BIN_DIR) — a symlink to the built CLI
+  # • installs a pre-push conflict hook
+  # • writes the CI-failure reporter workflow into each REGISTERED repo:
   #     .github/workflows/git-print-ci-status.yml
+  # flags: --cli-only (launcher only) · --ci-only (workflow only) · --dry-run
   ```
 
 - [ ] **(Re)write only the CI reporter workflow** *(skip hooks/gitignore)*

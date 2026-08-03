@@ -14,8 +14,10 @@
  */
 import { execSync, execFileSync } from "node:child_process";
 import { mkdir, unlink, writeFile } from "node:fs/promises";
-import { existsSync, readFileSync, writeFileSync, chmodSync, statSync, mkdirSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, chmodSync, statSync, mkdirSync, unlinkSync, symlinkSync, lstatSync, readlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
+import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { fetchAllPRData, fetchPRMetadata, fetchAllPages, renderPR, renderReport, resolveConflicts, extractConflicts, gitCommonDir, parseCombinedDiffSideMap, buildSideLineMap, readBlobLines, } from "./pr-renderer.js";
 import { addRepo, addWorktree, remove as removeConfig, list as listConfig, resolve as resolveAlias, getRepos, } from "./config.js";
 // ─── Repo .env loading ───────────────────────────────────────────────────────
@@ -207,11 +209,15 @@ REPO ALIASES  (config: ~/.config/git-print/config)
   git-print remove <alias>              Remove a repo and all its worktrees
   git-print remove <alias>/<name>       Remove a single worktree entry
 
-AUTO CONFLICT DETECTION  (pre-push hook)
-  git-print install     Install the pre-push hook
-                        git >= 2.54: config-based hook in ~/.gitconfig (global)
-                        git <  2.54: shell script in .git/hooks/pre-push
-  git-print uninstall   Remove the hook
+SETUP & AUTOMATION  (idempotent — safe to re-run any number of times)
+  git-print install     Install, all in one command:
+                          • git-print launcher on your PATH, independent of node
+                            version (~/.local/bin, or \$GIT_PRINT_BIN_DIR)
+                          • pre-push conflict hook
+                          • CI-failure reporter workflow in registered repos
+                        --cli-only  launcher only     --ci-only  workflow only
+                        --dry-run   preview, write nothing
+  git-print uninstall   Remove all of the above (--cli-only = just the launcher)
   git-print auto        Run manually: detect local conflicts, find the open
                         PR for the current branch, generate/overwrite files
                         Exits silently if no conflicts found
@@ -1285,18 +1291,159 @@ function installConflictHook() {
         }
     }
 }
+// ─── CLI launcher: make `git-print` runnable, independent of node version ──────
+//
+// `npm link` / `npm i -g` place the binary in the ACTIVE node's global bin dir.
+// Under a version manager (nvm, vite-plus, volta, asdf …) that dir changes with
+// every node switch, so the command silently drops off PATH — and repeated
+// linking scatters copies across several node dirs. This installs ONE launcher
+// at ONE deterministic, node-independent path: a symlink (or, where symlinks are
+// unavailable, a tiny wrapper) to the built dist/cli.js, run by whatever `node`
+// is on PATH via its shebang.
+//
+// Idempotent by contract: run it any number of times and it always converges to
+// exactly one clean launcher at the same path. Already correct → it does nothing.
+// A foreign file already at that path is never clobbered. Portable for every
+// user — no machine-specific paths, honors $GIT_PRINT_BIN_DIR, and if the dir
+// isn't on PATH it only PRINTS the line to add (never edits your profile).
+const LAUNCHER_MARKER = "# git-print-launcher";
+/** The single, node-independent install location for the `git-print` command.
+ *  Deterministic per environment: $GIT_PRINT_BIN_DIR, else the user bin dir. */
+function cliLauncherDir() {
+    const override = (process.env.GIT_PRINT_BIN_DIR || "").trim();
+    return override || join(homedir(), ".local", "bin");
+}
+/** Absolute path to the built CLI entry — this module at runtime (dist/cli.js),
+ *  resolved through symlinks so it's identical however git-print was invoked. */
+function cliEntryPath() {
+    return fileURLToPath(import.meta.url);
+}
+/** A launcher WE own: a symlink to some …/cli.js, or a wrapper with our marker. */
+function isOurLauncher(p) {
+    try {
+        const st = lstatSync(p);
+        if (st.isSymbolicLink())
+            return /(?:^|[\\/])cli\.js$/.test(readlinkSync(p));
+        if (st.isFile())
+            return readFileSync(p, "utf-8").includes(LAUNCHER_MARKER);
+    }
+    catch { /* nothing there */ }
+    return false;
+}
+/** True when the launcher already points exactly at `entry` (nothing to do). */
+function launcherMatches(p, entry) {
+    try {
+        const st = lstatSync(p);
+        if (st.isSymbolicLink())
+            return readlinkSync(p) === entry;
+        if (st.isFile()) {
+            const t = readFileSync(p, "utf-8");
+            return t.includes(LAUNCHER_MARKER) && t.includes(entry);
+        }
+    }
+    catch { /* nothing there */ }
+    return false;
+}
+/** Anything at all at this path, including a broken symlink. */
+function pathPresent(p) {
+    try {
+        lstatSync(p);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+function installCliLauncher(dryRun = false) {
+    const dir = cliLauncherDir();
+    const entry = cliEntryPath();
+    const launcher = join(dir, "git-print");
+    const onPath = (process.env.PATH || "").split(":").some((p) => p === dir);
+    const printPathHint = () => console.log(onPath
+        ? `   ✓ ${dir} is on your PATH`
+        : `   ⚠ ${dir} is not on your PATH — add it, then restart your shell:\n       export PATH="${dir}:$PATH"`);
+    // Already correct → no-op. Safe to run any number of times.
+    if (launcherMatches(launcher, entry)) {
+        console.log(`   ✓ already linked: ${launcher} → ${entry}`);
+        printPathHint();
+        return;
+    }
+    // A file we don't recognise sits at our path → never clobber it.
+    if (pathPresent(launcher) && !isOurLauncher(launcher)) {
+        console.log(`   ⚠ ${launcher} exists and isn't a git-print launcher — leaving it untouched.`);
+        console.log(`     Set $GIT_PRINT_BIN_DIR to install elsewhere, or remove that file yourself.`);
+        return;
+    }
+    if (dryRun) {
+        console.log(`   ✓ would link ${launcher} → ${entry}  (dry-run)`);
+        printPathHint();
+        return;
+    }
+    try {
+        mkdirSync(dir, { recursive: true });
+        try {
+            chmodSync(entry, 0o755);
+        }
+        catch { /* best effort */ }
+        if (isOurLauncher(launcher)) {
+            try {
+                unlinkSync(launcher);
+            }
+            catch { /* recreated below */ }
+        }
+        try {
+            symlinkSync(entry, launcher);
+            console.log(`   ✓ linked ${launcher} → ${entry}`);
+        }
+        catch {
+            // Symlinks unavailable (some filesystems / platforms) — wrapper instead.
+            writeFileSync(launcher, `#!/bin/sh\n${LAUNCHER_MARKER}\nexec node "${entry}" "$@"\n`);
+            chmodSync(launcher, 0o755);
+            console.log(`   ✓ wrote launcher ${launcher} → node ${entry}`);
+        }
+    }
+    catch (e) {
+        console.log(`   ✗ could not install launcher in ${dir}: ${e.message}`);
+        console.log(`     Do it manually:  ln -sf "${entry}" "${launcher}"`);
+        return;
+    }
+    printPathHint();
+}
+function uninstallCliLauncher() {
+    const launcher = join(cliLauncherDir(), "git-print");
+    if (!isOurLauncher(launcher)) {
+        console.log(pathPresent(launcher)
+            ? `   ⚠ ${launcher} isn't a git-print launcher — leaving it untouched`
+            : `   (no launcher at ${launcher})`);
+        return;
+    }
+    try {
+        unlinkSync(launcher);
+        console.log(`   ✓ removed ${launcher}`);
+    }
+    catch (e) {
+        console.log(`   ✗ could not remove ${launcher}: ${e.message}`);
+    }
+}
 function runInstall(opts = {}) {
-    const { dryRun = false, ciOnly = false } = opts;
+    const { dryRun = false, ciOnly = false, cliOnly = false } = opts;
     console.log(dryRun ? "git-print install — DRY RUN (no changes written)\n" : "git-print install\n");
-    if (!ciOnly && !dryRun) {
+    if (!ciOnly) {
+        console.log("Command-line launcher (makes `git-print` runnable, independent of node version):");
+        installCliLauncher(dryRun);
+        console.log("");
+    }
+    if (!ciOnly && !cliOnly && !dryRun) {
         console.log("Conflict reporter (global pre-push hook):");
         installConflictHook();
         addToGlobalGitignore(".git-print/");
         console.log("");
     }
-    console.log(`CI-failure reporter (${CI_WORKFLOW_REL}) → registered repos:`);
-    writeCiWorkflows(dryRun);
-    console.log(`\n   Uninstall: git-print uninstall`);
+    if (!cliOnly) {
+        console.log(`CI-failure reporter (${CI_WORKFLOW_REL}) → registered repos:`);
+        writeCiWorkflows(dryRun);
+    }
+    console.log(`\n   Idempotent — safe to re-run any time. Uninstall: git-print uninstall`);
 }
 function removeCiWorkflows() {
     let removed = 0;
@@ -1343,12 +1490,17 @@ function uninstallConflictHook() {
         console.log(`   ✓ removed git-print lines from ${hookPath}`);
     }
 }
-function runUninstall() {
+function runUninstall(opts = {}) {
+    const { cliOnly = false } = opts;
     console.log("git-print uninstall\n");
-    console.log("Conflict reporter (pre-push hook):");
-    uninstallConflictHook();
-    console.log(`\nCI-failure reporter (${CI_WORKFLOW_REL}):`);
-    removeCiWorkflows();
+    console.log("Command-line launcher:");
+    uninstallCliLauncher();
+    if (!cliOnly) {
+        console.log("\nConflict reporter (pre-push hook):");
+        uninstallConflictHook();
+        console.log(`\nCI-failure reporter (${CI_WORKFLOW_REL}):`);
+        removeCiWorkflows();
+    }
 }
 // ─── ci-status subcommand ───────────────────────────────────────────────────
 //
@@ -1441,10 +1593,10 @@ if (isEntry) {
         });
     }
     else if (sub === "install") {
-        runInstall({ dryRun: args.includes("--dry-run"), ciOnly: args.includes("--ci-only") });
+        runInstall({ dryRun: args.includes("--dry-run"), ciOnly: args.includes("--ci-only"), cliOnly: args.includes("--cli-only") });
     }
     else if (sub === "uninstall") {
-        runUninstall();
+        runUninstall({ cliOnly: args.includes("--cli-only") });
     }
     else if (sub === "ci-status") {
         runCiStatus(args.slice(1)).catch((e) => {

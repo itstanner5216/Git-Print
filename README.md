@@ -136,12 +136,15 @@ The agent reads `PR-{n}-conflicts.md`, runs one command per file, and creates a 
 ## Installation
 
 ```sh
-git clone https://github.com/itstanner5216/Git-Print.git
-cd Git-Print
-pnpm install
-pnpm build
-npm link   # makes git-print available system-wide
+npm install -g github:itstanner5216/Git-Print   # installs the git-print command
+git-print install                                # hooks + CI reporter + a durable launcher
 ```
+
+Two commands, both **idempotent** — re-run them any time. `npm install -g` puts `git-print` on your PATH; `git-print install` wires up the pre-push conflict hook and CI-failure reporter for your registered repos, and drops a **node-version-independent** launcher into `~/.local/bin` (override with `$GIT_PRINT_BIN_DIR`).
+
+That launcher matters: `npm install -g` on its own lands in the *active* node's bin dir, so it falls off your PATH the moment you switch node versions (nvm / volta / asdf). The `~/.local/bin` launcher keeps `git-print` working across those switches.
+
+**Developing on a local clone?** `git clone` → `pnpm install && pnpm build` → `node dist/cli.js install` once (same command, run directly before the shortcut exists). The launcher then points at your clone, so rebuilds are live.
 
 **Requirements:**
 - Node.js 18+ (native `fetch`, no polyfills needed)

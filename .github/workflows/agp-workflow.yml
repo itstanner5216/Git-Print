@@ -82,7 +82,8 @@ jobs:
         uses: actions/checkout@v5
       - name: Sonatype Guide gate
         id: gate
-        uses: sonatype/agp-action/gate@v1
+        # Pinned to v1.9.0 commit SHA for supply-chain security
+        uses: sonatype/agp-action/gate@41940121a017240d481fb0f355e0934baf724d2e
         with:
           guide-url: ${{ vars.AGP_API_URL }}
 
@@ -103,14 +104,21 @@ jobs:
         # GitHub jobs run separately and don't share files, so fetch the governed configuration
         # again here for the AGP run below to use.
         id: agp_gate
-        uses: sonatype/agp-action/gate@v1
+        # Pinned to v1.9.0 commit SHA for supply-chain security
+        uses: sonatype/agp-action/gate@41940121a017240d481fb0f355e0934baf724d2e
         with:
           guide-url: ${{ vars.AGP_API_URL }}
 
       - name: Run AGP
         if: steps.agp_gate.outputs.directive == 'run'
-        uses: sonatype/agp-action@v1
+        # Pinned to v1.9.0 commit SHA for supply-chain security
+        uses: sonatype/agp-action@41940121a017240d481fb0f355e0934baf724d2e
         with:
+          # Pinned to version tag matching action release for stability.
+          # For full supply-chain security, replace with an immutable digest:
+          # docker-image: sonatype/agp@sha256:<digest>
+          # Obtain digest via: docker pull sonatype/agp:1.9.0 && docker inspect --format='{{index .RepoDigests 0}}' sonatype/agp:1.9.0
+          docker-image: sonatype/agp:1.9.0
           # Forward the dispatch inputs so a backend-triggered run targets the right mode.
           # A full/scheduled run sends mode=full; security-fix sends mode=security
           # with a vulnerabilities payload; heal sends mode=heal with repo_id; and

@@ -1,0 +1,4 @@
+{
+  "fastModel": "openai:deepseek-flash\u0000https://api.deepseek.com",
+  "$version": 4
+}

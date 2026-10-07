@@ -35,6 +35,7 @@ export interface PRMetadata {
   number: number;
   state: string;
   body: string | null;
+  body_text?: string | null;
   author_association: string;
   created_at: string;
   updated_at: string;
@@ -231,12 +232,13 @@ function sleep(ms: number): Promise<void> {
 }
 
 export async function apiFetch(
-  path: string, token: string, rl: RateLimitState = createRateLimitState()
+  path: string, token: string, rl: RateLimitState = createRateLimitState(),
+  accept = "application/vnd.github+json"
 ): Promise<any> {
   await waitForRateLimit(rl);
   const url = path.startsWith("http") ? path : `${API_BASE}${path}`;
   const headers: Record<string, string> = {
-    Accept: "application/vnd.github+json",
+    Accept: accept,
     "X-GitHub-Api-Version": "2022-11-28",
   };
   if (token) headers.Authorization = `Bearer ${token}`;
@@ -249,7 +251,8 @@ export async function apiFetch(
 }
 
 export async function fetchAllPages<T = any>(
-  path: string, token: string, rl: RateLimitState = createRateLimitState()
+  path: string, token: string, rl: RateLimitState = createRateLimitState(),
+  accept = "application/vnd.github+json"
 ): Promise<T[]> {
   const items: T[] = [];
   let url: string | null = path.startsWith("http") ? path : `${API_BASE}${path}`;
@@ -257,7 +260,7 @@ export async function fetchAllPages<T = any>(
   if (!url.includes("per_page")) url += `${separator}per_page=100`;
 
   const pageHeaders: Record<string, string> = {
-    Accept: "application/vnd.github+json",
+    Accept: accept,
     "X-GitHub-Api-Version": "2022-11-28",
   };
   if (token) pageHeaders.Authorization = `Bearer ${token}`;
@@ -318,14 +321,15 @@ async function graphqlFetch(
 // ─── Shared data fetcher ─────────────────────────────────────────────────────
 
 async function fetchPRWithMergeable(
-  owner: string, repo: string, pr: number, token: string, rl: RateLimitState
+  owner: string, repo: string, pr: number, token: string, rl: RateLimitState,
+  accept = "application/vnd.github+json"
 ): Promise<PRMetadata> {
   const path = `/repos/${owner}/${repo}/pulls/${pr}`;
-  let data = await apiFetch(path, token, rl);
+  let data = await apiFetch(path, token, rl, accept);
   let attempts = 0;
   while (data.mergeable === null && attempts < 10) {
     await sleep(2000);
-    data = await apiFetch(path, token, rl);
+    data = await apiFetch(path, token, rl, accept);
     attempts++;
   }
   return data;
@@ -447,11 +451,11 @@ export async function fetchAllPRData(
 
   // Phase 1: parallel fetch everything except checks (need headSha)
   const [pr, commits, reviews, reviewComments, issueComments, files] = await Promise.all([
-    fetchPRWithMergeable(owner, repo, pullNumber, token, rl),
+    fetchPRWithMergeable(owner, repo, pullNumber, token, rl, "application/vnd.github.full+json"),
     fetchAllPages(`${prPath}/commits`, token, rl),
-    fetchAllPages(`${prPath}/reviews`, token, rl),
-    fetchAllPages(`${prPath}/comments`, token, rl),
-    fetchAllPages(`${base}/issues/${pullNumber}/comments`, token, rl),
+    fetchAllPages(`${prPath}/reviews`, token, rl, "application/vnd.github.full+json"),
+    fetchAllPages(`${prPath}/comments`, token, rl, "application/vnd.github.full+json"),
+    fetchAllPages(`${base}/issues/${pullNumber}/comments`, token, rl, "application/vnd.github.full+json"),
     fetchAllPages(`${prPath}/files`, token, rl),
   ]);
 
@@ -1152,11 +1156,21 @@ function transformProse(s: string, transform: (prose: string) => string): string
       // consume adjacent whitespace and punctuation, and a delimiter that got
       // consumed would break restoration — deleting the code span and leaking
       // token text. Plain hex with colons survives every pass untouched.
-      const tokenized = part.replace(/`[^`\n]*`/g, (m) => {
+      let tokenized = part.replace(/`[^`\n]*`/g, (m) => {
         const token = `${nonce}:${spans.length}:`;
         spans.push(m);
         return token;
       });
+      // A multiline single-backtick span is otherwise left on the existing
+      // prose path. Shield only literal tag tokens inside it so HTML cleanup
+      // cannot delete source code the GitHub UI visibly renders.
+      tokenized = tokenized.replace(/`[^`\n]*(?:\n(?!\n)[^`\n]*)+`/g, (m) =>
+        m.replace(/<\/?[A-Za-z][A-Za-z0-9:-]*(?:\s[^<>]*?)?\s*\/?>/g, (tag) => {
+          const token = `${nonce}:${spans.length}:`;
+          spans.push(tag);
+          return token;
+        })
+      );
       let out = transform(tokenized);
       for (let j = 0; j < spans.length; j++) {
         out = out.split(`${nonce}:${j}:`).join(spans[j]);
@@ -1581,7 +1595,7 @@ function stripLinkDebris(body: string): string {
  *           HTML comments, collapsed bot boilerplate, share/promo/status
  *           lines, and whole comments that are nothing but promotion.
  */
-export function cleanCommentBody(raw: string, findingHeader?: string): string {
+export function cleanCommentBody(raw: string, findingHeader?: string, renderedText?: string | null): string {
   let s = (raw || "").replace(/\r\n/g, "\n");
 
   // HTML comments (bot metadata markers) — invisible on the rendered PR page.
@@ -1632,7 +1646,7 @@ export function cleanCommentBody(raw: string, findingHeader?: string): string {
         (_m: string, x: string) => "`" + x.replace(/<[^>]+>/g, "").replace(/`/g, "").trim() + "`")
       .replace(/<(?:i|em)>\s*<(?:b|strong)>([\s\S]*?)<\/(?:b|strong)>\s*<\/(?:i|em)>/gi,
         (_m: string, x: string) => "`" + x.replace(/<[^>]+>/g, "").replace(/`/g, "").trim() + "`")
-      .replace(/<\/?(?:strong|b)>/gi, "**")
+      .replace(/<\/?(?:strong|b)\b[^>]*>/gi, "**")
       .replace(/<\/?(?:em|i)>/gi, "*")
       // <code> → inline code. Bots put markdown links INSIDE <code> (qodo's
       // file-location and rule links); once backticked they'd be shielded
@@ -1734,6 +1748,16 @@ export function cleanCommentBody(raw: string, findingHeader?: string): string {
   // If nothing but punctuation / rules / emoji remains, treat as empty so the
   // card is skipped rather than printed as a stray "---" or lone symbol.
   if (!/[\p{L}\p{N}]/u.test(s)) return "";
+
+  // GitHub's rendered text is authoritative for whether a leftover tag token
+  // is actually visible. Remove only the exact token GitHub proves invisible;
+  // code stays protected by transformProse and everything else is untouched.
+  if (renderedText != null) {
+    s = transformProse(s, (seg) =>
+      seg.replace(/<\/?[A-Za-z][A-Za-z0-9:-]*(?:\s[^<>]*?)?\s*\/?>/g,
+        (tag) => renderedText.includes(tag) ? tag : "")
+    );
+  }
 
   return s;
 }
@@ -1861,7 +1885,7 @@ export async function renderPR(data: PRData, options: PRRendererOptions): Promis
       blank();
     }
     const body = numberAnnotatedDiffFences(
-      cleanCommentBody(stripSeverityLine(stripSuggestionBlocks(root.body || ""))), fenceCtx,
+      cleanCommentBody(stripSeverityLine(stripSuggestionBlocks(root.body || "")), undefined, root.body_text), fenceCtx,
       { path: filePath, line: sl ?? el });
     if (body) { w(body); blank(); }
 
@@ -1893,7 +1917,7 @@ export async function renderPR(data: PRData, options: PRRendererOptions): Promis
       w(`${actorEmoji(reply.user)} **${displayActor(reply.user)}** replied · ${formatDate(reply.created_at)}${rSeverityTag}`);
       blank();
       const rbody = numberAnnotatedDiffFences(
-        cleanCommentBody(stripSeverityLine(stripSuggestionBlocks(reply.body || ""))), fenceCtx,
+        cleanCommentBody(stripSeverityLine(stripSuggestionBlocks(reply.body || "")), undefined, reply.body_text), fenceCtx,
         { path: reply.path || filePath, line: (reply.start_line ?? reply.original_start_line ?? sl) ?? (reply.line ?? reply.original_line ?? el) });
       if (rbody) { w(rbody); blank(); }
       const rsl = reply.start_line ?? reply.original_start_line ?? sl;
@@ -1932,7 +1956,7 @@ export async function renderPR(data: PRData, options: PRRendererOptions): Promis
 
   // ── PR description (directly under the title, not labeled as a comment) ───────
   blank();
-  const descClean = pr.body && pr.body.trim() ? cleanCommentBody(pr.body) : "";
+  const descClean = pr.body && pr.body.trim() ? cleanCommentBody(pr.body, undefined, pr.body_text) : "";
   w(descClean || "_No description provided._");
 
   // ── PR information ───────────────────────────────────────────────────────────
@@ -1983,13 +2007,13 @@ export async function renderPR(data: PRData, options: PRRendererOptions): Promis
       // re-captioned exactly like a comment, so the render stays one visual
       // language.
       body = numberAnnotatedDiffFences(
-        cleanCommentBody(c.body || "", `${actorEmoji(c.user)} **${displayActor(c.user)}** · ${formatDate(c.created_at)}`), fenceCtx);
+        cleanCommentBody(c.body || "", `${actorEmoji(c.user)} **${displayActor(c.user)}** · ${formatDate(c.created_at)}`, c.body_text), fenceCtx);
       if (!body) continue;
     } else if (card.kind === "review_event") {
       const r = card.data;
       header = `${actorEmoji(r.user)} **${displayActor(r.user)}** ${reviewVerb(r.state)} · ${formatDate(r.submitted_at || r.created_at)}`;
       body = numberAnnotatedDiffFences(
-        cleanCommentBody(r.body || "", `${actorEmoji(r.user)} **${displayActor(r.user)}** · ${formatDate(r.submitted_at || r.created_at)}`), fenceCtx);
+        cleanCommentBody(r.body || "", `${actorEmoji(r.user)} **${displayActor(r.user)}** · ${formatDate(r.submitted_at || r.created_at)}`, r.body_text), fenceCtx);
       const verdict = String(r.state || "").toUpperCase();
       const hasVerdict = verdict === "CHANGES_REQUESTED" || verdict === "APPROVED" || verdict === "DISMISSED";
       if (!body && !hasVerdict && reviewThreads.length === 0) continue;

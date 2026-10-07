@@ -25,6 +25,7 @@ export interface PRMetadata {
     number: number;
     state: string;
     body: string | null;
+    body_text?: string | null;
     author_association: string;
     created_at: string;
     updated_at: string;
@@ -186,8 +187,8 @@ export interface ResolveResult {
     };
     error?: string;
 }
-export declare function apiFetch(path: string, token: string, rl?: RateLimitState): Promise<any>;
-export declare function fetchAllPages<T = any>(path: string, token: string, rl?: RateLimitState): Promise<T[]>;
+export declare function apiFetch(path: string, token: string, rl?: RateLimitState, accept?: string): Promise<any>;
+export declare function fetchAllPages<T = any>(path: string, token: string, rl?: RateLimitState, accept?: string): Promise<T[]>;
 /**
  * Lightweight fetch — just the PR metadata (single API call + mergeable polling).
  * Use this when you only need branch names and merge status (e.g. resolve mode).
@@ -235,7 +236,7 @@ export declare function attachAutomatedSuggestions(prHtmlUrl: string | undefined
  *           HTML comments, collapsed bot boilerplate, share/promo/status
  *           lines, and whole comments that are nothing but promotion.
  */
-export declare function cleanCommentBody(raw: string, findingHeader?: string): string;
+export declare function cleanCommentBody(raw: string, findingHeader?: string, renderedText?: string | null): string;
 export declare function renderPR(data: PRData, options: PRRendererOptions): Promise<void>;
 export declare function renderReport(data: PRData, options: PRRendererOptions): Promise<void>;
 /**

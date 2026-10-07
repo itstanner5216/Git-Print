@@ -18,8 +18,8 @@ import { cleanCommentBody } from "../dist/pr-renderer.js";
 let pass = 0;
 const failures = [];
 
-function eq(name, input, expected) {
-  const got = cleanCommentBody(input);
+function eq(name, input, expected, renderedText) {
+  const got = cleanCommentBody(input, undefined, renderedText);
   if (got === expected) { pass++; return; }
   failures.push({ name, input, expected, got });
 }
@@ -100,6 +100,11 @@ eq("inline code span with angle URL kept",
   "The literal `<https://example.com>` form",
   "The literal `<https://example.com>` form");
 
+const multilineHtmlCode = "Context: li.innerHTML = `\n    <span class=\"dot\"></span>\n    <div class=\"thread-meta\"></div>\n    <button type=\"button\">×</button>`";
+eq("multiline inline code span with HTML kept byte-faithful",
+  multilineHtmlCode,
+  multilineHtmlCode);
+
 eq("suggestion fence untouched",
   "Try this:\n\n```suggestion\nconst x = arr[0];\n```",
   "Try this:\n\n```suggestion\nconst x = arr[0];\n```");
@@ -165,6 +170,15 @@ eq("details boilerplate removed",
 eq("anchor tag unwrapped to text",
   "See <a href=\"https://x.com/profile\">the docs</a> here",
   "See the docs here");
+
+eq("strong tag with attributes converts symmetrically",
+  "- [ ] <!-- meta --> <strong title=\"Keep fixing\">Autopilot</strong> · Keep fixing",
+  "- [ ]  **Autopilot** · Keep fixing");
+
+eq("rendered-text check removes only confirmed invisible tag tokens",
+  "A  <relative-time datetime=\"x\">2026</relative-time>  B",
+  "A  2026  B",
+  "A  2026  B");
 
 // ─── Review-audit regression cases (findings 2.1–2.6) ───────────────────────
 

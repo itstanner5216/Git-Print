@@ -36,11 +36,11 @@ async function waitForRateLimit(rl) {
 function sleep(ms) {
     return new Promise((r) => setTimeout(r, ms));
 }
-export async function apiFetch(path, token, rl = createRateLimitState()) {
+export async function apiFetch(path, token, rl = createRateLimitState(), accept = "application/vnd.github+json") {
     await waitForRateLimit(rl);
     const url = path.startsWith("http") ? path : `${API_BASE}${path}`;
     const headers = {
-        Accept: "application/vnd.github+json",
+        Accept: accept,
         "X-GitHub-Api-Version": "2022-11-28",
     };
     if (token)
@@ -52,14 +52,14 @@ export async function apiFetch(path, token, rl = createRateLimitState()) {
     }
     return res.json();
 }
-export async function fetchAllPages(path, token, rl = createRateLimitState()) {
+export async function fetchAllPages(path, token, rl = createRateLimitState(), accept = "application/vnd.github+json") {
     const items = [];
     let url = path.startsWith("http") ? path : `${API_BASE}${path}`;
     const separator = url.includes("?") ? "&" : "?";
     if (!url.includes("per_page"))
         url += `${separator}per_page=100`;
     const pageHeaders = {
-        Accept: "application/vnd.github+json",
+        Accept: accept,
         "X-GitHub-Api-Version": "2022-11-28",
     };
     if (token)
@@ -118,13 +118,13 @@ async function graphqlFetch(query, variables, token, rl = createRateLimitState()
     return res.json();
 }
 // ─── Shared data fetcher ─────────────────────────────────────────────────────
-async function fetchPRWithMergeable(owner, repo, pr, token, rl) {
+async function fetchPRWithMergeable(owner, repo, pr, token, rl, accept = "application/vnd.github+json") {
     const path = `/repos/${owner}/${repo}/pulls/${pr}`;
-    let data = await apiFetch(path, token, rl);
+    let data = await apiFetch(path, token, rl, accept);
     let attempts = 0;
     while (data.mergeable === null && attempts < 10) {
         await sleep(2000);
-        data = await apiFetch(path, token, rl);
+        data = await apiFetch(path, token, rl, accept);
         attempts++;
     }
     return data;
@@ -228,11 +228,11 @@ export async function fetchAllPRData(owner, repo, pullNumber, token, graphqlToke
     console.error(`Fetching PR #${pullNumber} from ${owner}/${repo}...`);
     // Phase 1: parallel fetch everything except checks (need headSha)
     const [pr, commits, reviews, reviewComments, issueComments, files] = await Promise.all([
-        fetchPRWithMergeable(owner, repo, pullNumber, token, rl),
+        fetchPRWithMergeable(owner, repo, pullNumber, token, rl, "application/vnd.github.full+json"),
         fetchAllPages(`${prPath}/commits`, token, rl),
-        fetchAllPages(`${prPath}/reviews`, token, rl),
-        fetchAllPages(`${prPath}/comments`, token, rl),
-        fetchAllPages(`${base}/issues/${pullNumber}/comments`, token, rl),
+        fetchAllPages(`${prPath}/reviews`, token, rl, "application/vnd.github.full+json"),
+        fetchAllPages(`${prPath}/comments`, token, rl, "application/vnd.github.full+json"),
+        fetchAllPages(`${base}/issues/${pullNumber}/comments`, token, rl, "application/vnd.github.full+json"),
         fetchAllPages(`${prPath}/files`, token, rl),
     ]);
     const headSha = pr.head.sha;
@@ -899,11 +899,19 @@ function transformProse(s, transform) {
         // consume adjacent whitespace and punctuation, and a delimiter that got
         // consumed would break restoration — deleting the code span and leaking
         // token text. Plain hex with colons survives every pass untouched.
-        const tokenized = part.replace(/`[^`\n]*`/g, (m) => {
+        let tokenized = part.replace(/`[^`\n]*`/g, (m) => {
             const token = `${nonce}:${spans.length}:`;
             spans.push(m);
             return token;
         });
+        // A multiline single-backtick span is otherwise left on the existing
+        // prose path. Shield only literal tag tokens inside it so HTML cleanup
+        // cannot delete source code the GitHub UI visibly renders.
+        tokenized = tokenized.replace(/`[^`\n]*(?:\n(?!\n)[^`\n]*)+`/g, (m) => m.replace(/<\/?[A-Za-z][A-Za-z0-9:-]*(?:\s[^<>]*?)?\s*\/?>/g, (tag) => {
+            const token = `${nonce}:${spans.length}:`;
+            spans.push(tag);
+            return token;
+        }));
         let out = transform(tokenized);
         for (let j = 0; j < spans.length; j++) {
             out = out.split(`${nonce}:${j}:`).join(spans[j]);
@@ -1314,7 +1322,7 @@ function stripLinkDebris(body) {
  *           HTML comments, collapsed bot boilerplate, share/promo/status
  *           lines, and whole comments that are nothing but promotion.
  */
-export function cleanCommentBody(raw, findingHeader) {
+export function cleanCommentBody(raw, findingHeader, renderedText) {
     let s = (raw || "").replace(/\r\n/g, "\n");
     // HTML comments (bot metadata markers) — invisible on the rendered PR page.
     // Masked, not split: a multi-line comment may legitimately span a fence
@@ -1351,7 +1359,7 @@ export function cleanCommentBody(raw, findingHeader) {
         .replace(/<a\b[^>]*>([\s\S]*?)<\/a>/gi, "$1")
         .replace(/<(?:b|strong)>\s*<(?:i|em)>([\s\S]*?)<\/(?:i|em)>\s*<\/(?:b|strong)>/gi, (_m, x) => "`" + x.replace(/<[^>]+>/g, "").replace(/`/g, "").trim() + "`")
         .replace(/<(?:i|em)>\s*<(?:b|strong)>([\s\S]*?)<\/(?:b|strong)>\s*<\/(?:i|em)>/gi, (_m, x) => "`" + x.replace(/<[^>]+>/g, "").replace(/`/g, "").trim() + "`")
-        .replace(/<\/?(?:strong|b)>/gi, "**")
+        .replace(/<\/?(?:strong|b)\b[^>]*>/gi, "**")
         .replace(/<\/?(?:em|i)>/gi, "*")
         // <code> → inline code. Bots put markdown links INSIDE <code> (qodo's
         // file-location and rule links); once backticked they'd be shielded
@@ -1461,6 +1469,12 @@ export function cleanCommentBody(raw, findingHeader) {
     // card is skipped rather than printed as a stray "---" or lone symbol.
     if (!/[\p{L}\p{N}]/u.test(s))
         return "";
+    // GitHub's rendered text is authoritative for whether a leftover tag token
+    // is actually visible. Remove only the exact token GitHub proves invisible;
+    // code stays protected by transformProse and everything else is untouched.
+    if (renderedText != null) {
+        s = transformProse(s, (seg) => seg.replace(/<\/?[A-Za-z][A-Za-z0-9:-]*(?:\s[^<>]*?)?\s*\/?>/g, (tag) => renderedText.includes(tag) ? tag : ""));
+    }
     return s;
 }
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1571,7 +1585,7 @@ export async function renderPR(data, options) {
             w(authorLine);
             blank();
         }
-        const body = numberAnnotatedDiffFences(cleanCommentBody(stripSeverityLine(stripSuggestionBlocks(root.body || ""))), fenceCtx, { path: filePath, line: sl ?? el });
+        const body = numberAnnotatedDiffFences(cleanCommentBody(stripSeverityLine(stripSuggestionBlocks(root.body || "")), undefined, root.body_text), fenceCtx, { path: filePath, line: sl ?? el });
         if (body) {
             w(body);
             blank();
@@ -1604,7 +1618,7 @@ export async function renderPR(data, options) {
             const rSeverityTag = rSeverity ? ` · Severity: ${rSeverity}` : "";
             w(`${actorEmoji(reply.user)} **${displayActor(reply.user)}** replied · ${formatDate(reply.created_at)}${rSeverityTag}`);
             blank();
-            const rbody = numberAnnotatedDiffFences(cleanCommentBody(stripSeverityLine(stripSuggestionBlocks(reply.body || ""))), fenceCtx, { path: reply.path || filePath, line: (reply.start_line ?? reply.original_start_line ?? sl) ?? (reply.line ?? reply.original_line ?? el) });
+            const rbody = numberAnnotatedDiffFences(cleanCommentBody(stripSeverityLine(stripSuggestionBlocks(reply.body || "")), undefined, reply.body_text), fenceCtx, { path: reply.path || filePath, line: (reply.start_line ?? reply.original_start_line ?? sl) ?? (reply.line ?? reply.original_line ?? el) });
             if (rbody) {
                 w(rbody);
                 blank();
@@ -1644,7 +1658,7 @@ export async function renderPR(data, options) {
     w(`Conversation ${conversationCount} · Commits ${commits.length} · Checks ${unifiedChecks.length} · Files changed ${pr.changed_files} · \`+${pr.additions}\` \`−${pr.deletions}\``);
     // ── PR description (directly under the title, not labeled as a comment) ───────
     blank();
-    const descClean = pr.body && pr.body.trim() ? cleanCommentBody(pr.body) : "";
+    const descClean = pr.body && pr.body.trim() ? cleanCommentBody(pr.body, undefined, pr.body_text) : "";
     w(descClean || "_No description provided._");
     // ── PR information ───────────────────────────────────────────────────────────
     blank();
@@ -1692,14 +1706,14 @@ export async function renderPR(data, options) {
             // that pack several numbered findings into one body — each finding gets
             // re-captioned exactly like a comment, so the render stays one visual
             // language.
-            body = numberAnnotatedDiffFences(cleanCommentBody(c.body || "", `${actorEmoji(c.user)} **${displayActor(c.user)}** · ${formatDate(c.created_at)}`), fenceCtx);
+            body = numberAnnotatedDiffFences(cleanCommentBody(c.body || "", `${actorEmoji(c.user)} **${displayActor(c.user)}** · ${formatDate(c.created_at)}`, c.body_text), fenceCtx);
             if (!body)
                 continue;
         }
         else if (card.kind === "review_event") {
             const r = card.data;
             header = `${actorEmoji(r.user)} **${displayActor(r.user)}** ${reviewVerb(r.state)} · ${formatDate(r.submitted_at || r.created_at)}`;
-            body = numberAnnotatedDiffFences(cleanCommentBody(r.body || "", `${actorEmoji(r.user)} **${displayActor(r.user)}** · ${formatDate(r.submitted_at || r.created_at)}`), fenceCtx);
+            body = numberAnnotatedDiffFences(cleanCommentBody(r.body || "", `${actorEmoji(r.user)} **${displayActor(r.user)}** · ${formatDate(r.submitted_at || r.created_at)}`, r.body_text), fenceCtx);
             const verdict = String(r.state || "").toUpperCase();
             const hasVerdict = verdict === "CHANGES_REQUESTED" || verdict === "APPROVED" || verdict === "DISMISSED";
             if (!body && !hasVerdict && reviewThreads.length === 0)
